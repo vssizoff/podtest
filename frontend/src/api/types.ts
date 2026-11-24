@@ -1,0 +1,12 @@
+export type User = { id: string; display_name: string; email: string; avatar_url: string }
+export type Session = { authenticated: boolean; user?: User; csrf_token?: string }
+export type Course = { id: string; title: string; description: string; created_at: string; can_manage: boolean }
+export type Contest = Course & { status: 'draft' | 'open' | 'closed'; starts_at?: string; ends_at?: string }
+export type Problem = { id: string; title: string; description: string; created_at: string; can_manage: boolean }
+export type ContestProblem = { id: string; problem_id: string; problem_revision_id: string; title: string; position: number; max_score: string; verdict_visibility: 'hidden' | 'summary' | 'tests'; grader_mode?: string }
+export type Statement = { locale: string; rendered_html: string; digest: string; renderer_version: string }
+export type Submission = { id: string; contest_id: string; contest_problem_id: string; problem_revision_id: string; submitted_at: string; language: string }
+export type Attempt = { id: string; attempt_number: number; status: string; verdict?: string; base_score?: string; tests?: { test_id: string; verdict: string; score?: string }[] }
+export type Material = { material_id: string; material_revision_id: string; position: number; visibility: string; title: string; format: string; rendered_html: string }
+export type Scoreboard = { contest_id: string; problems: { id: string; title: string; max_score: string }[]; participants: { id: string; user_id: string; display_name: string }[]; rows: { participant_id: string; rank: number; total: string; scores: Record<string, string> }[] }
+export type Page<T> = { items: T[]; next?: string }

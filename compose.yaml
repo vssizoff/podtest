@@ -1,0 +1,143 @@
+x-backend: &backend
+  image: localhost/podtest-backend:dev
+  build:
+    context: .
+    dockerfile: deploy/backend.Dockerfile
+  environment: &backend-env
+    DATABASE_URL: ${DATABASE_URL:-postgres://podtest:podtest-local-db@postgres:5432/podtest?sslmode=disable}
+    PUBLIC_URL: ${PUBLIC_URL}
+    APP_ENV: ${APP_ENV:-production}
+    OIDC_ISSUER_URL: ${OIDC_ISSUER_URL}
+    OIDC_CLIENT_ID: ${OIDC_CLIENT_ID}
+    OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET}
+    FGA_URL: ${FGA_URL:-http://openfga:8080}
+    FGA_TOKEN: ${FGA_TOKEN:-}
+    FGA_STORE_ID: ${FGA_STORE_ID:-}
+    FGA_MODEL_ID: ${FGA_MODEL_ID:-}
+    FGA_STATE_FILE: /fga/state.json
+    NATS_URL: nats://nats:4222
+    JUDGING_NO_INVOKER: ${JUDGING_NO_INVOKER:-false}
+    S3_URL: http://minio:9000
+    S3_BUCKET: ${S3_BUCKET:-podtest}
+    S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+    S3_SECRET_KEY: ${S3_SECRET_KEY}
+  networks: [data]
+  logging: &logs
+    driver: k8s-file
+    options: {max-size: 10mb}
+
+services:
+  nginx:
+    build:
+      context: .
+      dockerfile: deploy/nginx.Dockerfile
+    ports: ['${HTTP_BIND:-127.0.0.1:8088}:8080']
+    networks: [edge]
+    restart: unless-stopped
+    logging: *logs
+  db-migrate:
+    <<: *backend
+    command: [migrate]
+    restart: on-failure
+    depends_on:
+      postgres: {condition: service_healthy}
+  storage-init:
+    <<: *backend
+    command: [storage-init]
+    restart: on-failure
+    depends_on: [minio]
+  openfga-model:
+    <<: *backend
+    command: [fga-load]
+    volumes: [fga-config:/fga]
+    restart: on-failure
+    depends_on:
+      openfga: {condition: service_started}
+  backend-api:
+    <<: *backend
+    command: [api]
+    networks: [edge, data, execution]
+    volumes: [fga-config:/fga:ro]
+    depends_on:
+      db-migrate: {condition: service_completed_successfully}
+      storage-init: {condition: service_completed_successfully}
+      openfga-model: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD, wget, -qO, /dev/null, http://127.0.0.1:8080/api/v1/health/ready]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+    mem_limit: 768m
+  backend-worker:
+    <<: *backend
+    command: [worker]
+    volumes: [fga-config:/fga:ro]
+    depends_on:
+      db-migrate: {condition: service_completed_successfully}
+      openfga-model: {condition: service_completed_successfully}
+      nats: {condition: service_started}
+    restart: unless-stopped
+  postgres:
+    image: docker.io/library/postgres:17.5-alpine3.21
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-podtest}
+      POSTGRES_DB: ${POSTGRES_DB:-podtest}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-podtest-local-db}
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -h 127.0.0.1 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes: [postgres:/var/lib/postgresql/data]
+    networks: [data]
+    restart: unless-stopped
+    logging: *logs
+  nats:
+    image: docker.io/library/nats:2.11.8-alpine
+    command: [-js, -sd, /data]
+    volumes: [nats:/data]
+    networks: [data]
+    restart: unless-stopped
+    logging: *logs
+  minio:
+    image: ${MINIO_IMAGE:-docker.io/minio/minio@sha256:a1a8bd4ac40ad7881a245bab97323e18f971e4d4cba2c2007ec1bedd21cbaba2}
+    command: [server, /data]
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY}
+    volumes: [minio:/data]
+    networks: [data]
+    restart: unless-stopped
+    logging: *logs
+  openfga:
+    image: docker.io/openfga/openfga:v1.11.3
+    command: [run]
+    environment: &fga-db
+      OPENFGA_DATASTORE_ENGINE: sqlite
+      OPENFGA_DATASTORE_URI: file:/home/nonroot/data/openfga.db
+      OPENFGA_PLAYGROUND_ENABLED: 'false'
+    volumes: [fga-data:/home/nonroot/data]
+    networks: [data]
+    depends_on:
+      openfga-migrate: {condition: service_completed_successfully}
+    restart: unless-stopped
+    logging: *logs
+  openfga-migrate:
+    image: docker.io/openfga/openfga:v1.11.3
+    command: [migrate]
+    environment: *fga-db
+    volumes: [fga-data:/home/nonroot/data]
+    networks: [data]
+    restart: on-failure
+
+networks:
+  edge: {}
+  data: {internal: true}
+  execution: {internal: true}
+volumes:
+  postgres: {}
+  nats: {}
+  minio: {}
+  fga-config: {}
+  fga-data: {}

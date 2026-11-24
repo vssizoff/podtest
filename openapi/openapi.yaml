@@ -1,0 +1,403 @@
+openapi: 3.1.0
+info:
+  title: Podtest API
+  version: 0.1.0
+  description: Public REST API; cookie session authentication and CSRF are same-origin.
+servers:
+  - url: /api/v1
+security:
+  - SessionCookie: []
+paths:
+  /health/ready:
+    get:
+      security: []
+      operationId: readiness
+      responses:
+        '200': { description: Ready }
+        '503': { $ref: '#/components/responses/Error' }
+  /me:
+    get:
+      operationId: getMe
+      responses:
+        '200': { description: Current account }
+        '401': { $ref: '#/components/responses/Error' }
+  /courses:
+    get:
+      operationId: listCourses
+      parameters: [{ $ref: '#/components/parameters/After' }]
+      responses:
+        '200': { description: Visible courses }
+    post:
+      operationId: createCourse
+      security: [{ SessionCookie: [], CSRF: [] }]
+      requestBody: { $ref: '#/components/requestBodies/TitleInput' }
+      responses:
+        '201': { description: Course created }
+  /courses/{id}:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    get:
+      operationId: getCourse
+      responses:
+        '200': { description: Course }
+        '404': { $ref: '#/components/responses/Error' }
+    patch:
+      operationId: updateCourse
+      security: [{ SessionCookie: [], CSRF: [] }]
+      requestBody: { $ref: '#/components/requestBodies/TitleInput' }
+      responses: { '200': { description: Updated course } }
+    delete:
+      operationId: archiveCourse
+      security: [{ SessionCookie: [], CSRF: [] }]
+      responses: { '204': { description: Archived } }
+  /courses/{id}/contests:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    get:
+      operationId: listCourseContests
+      responses: { '200': { description: Ordered, visible contests } }
+    post:
+      operationId: addCourseContest
+      security: [{ SessionCookie: [], CSRF: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [contest_id, position], properties: { contest_id: { type: string, format: uuid }, position: { type: integer, minimum: 0 } } }
+      responses: { '204': { description: Linked } }
+  /courses/{id}/contests/{contestId}:
+    parameters: [{ $ref: '#/components/parameters/ID' }, { name: contestId, in: path, required: true, schema: { type: string, format: uuid } }]
+    delete:
+      operationId: removeCourseContest
+      security: [{ SessionCookie: [], CSRF: [] }]
+      responses: { '204': { description: Unlinked; histories preserved } }
+  /contests:
+    get:
+      operationId: listContests
+      parameters: [{ $ref: '#/components/parameters/After' }]
+      responses: { '200': { description: Visible contests } }
+    post:
+      operationId: createContest
+      security: [{ SessionCookie: [], CSRF: [] }]
+      requestBody: { $ref: '#/components/requestBodies/TitleInput' }
+      responses: { '201': { description: Contest created } }
+  /contests/{id}:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    get:
+      operationId: getContest
+      responses: { '200': { description: Contest } }
+    patch:
+      operationId: updateContest
+      security: [{ SessionCookie: [], CSRF: [] }]
+      requestBody: { $ref: '#/components/requestBodies/TitleInput' }
+      responses: { '200': { description: Updated contest } }
+    delete:
+      operationId: archiveContest
+      security: [{ SessionCookie: [], CSRF: [] }]
+      responses: { '204': { description: Archived } }
+  /contests/{id}/settings:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    get:
+      operationId: getContestSettings
+      responses: { '200': { $ref: '#/components/responses/ContestSettings' } }
+    patch:
+      operationId: setContestSettings
+      security: [{ SessionCookie: [], CSRF: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status, self_registration, scoreboard_visibility]
+              properties:
+                status: { enum: [draft, open, closed] }
+                starts_at: { type: [string, 'null'], format: date-time }
+                ends_at: { type: [string, 'null'], format: date-time }
+                self_registration: { type: boolean }
+                scoreboard_visibility: { enum: [private, contest] }
+                max_queued_submissions: { type: [integer, 'null'], minimum: 1 }
+      responses: { '200': { $ref: '#/components/responses/ContestSettings' } }
+  /contests/{id}/participants:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    get:
+      operationId: listParticipants
+      responses: { '200': { description: Manager-visible participants } }
+    post:
+      operationId: registerParticipant
+      security: [{ SessionCookie: [], CSRF: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { user_id: { type: string, format: uuid }, self: { type: boolean, default: false } } }
+      responses: { '204': { description: Registered; unique per contest and user } }
+  /contests/{id}/participants/{userId}:
+    parameters: [{ $ref: '#/components/parameters/ID' }, { name: userId, in: path, required: true, schema: { type: string, format: uuid } }]
+    delete:
+      operationId: deactivateParticipant
+      security: [{ SessionCookie: [], CSRF: [] }]
+      responses: { '204': { description: Participant deactivated; history retained } }
+  /contests/{id}/problems:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    get:
+      operationId: listContestProblems
+      responses: { '200': { description: Exact pinned revisions } }
+    post:
+      operationId: attachProblem
+      security: [{ SessionCookie: [], CSRF: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [problem_id, problem_revision_id, position, max_score, verdict_visibility], properties: { problem_id: { type: string, format: uuid }, problem_revision_id: { type: string, format: uuid }, position: { type: integer, minimum: 0 }, max_score: { type: string, pattern: '^[0-9]{1,12}(\.[0-9]{1,6})?$' }, submission_limit: { type: [integer, 'null'], minimum: 1 }, verdict_visibility: { enum: [hidden, summary, tests] } } }
+      responses: { '201': { description: Pinned problem } }
+  /contests/{id}/problems/import/polygon:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    post:
+      operationId: importContestPolygon
+      description: Retains the original full Polygon ZIP privately and attaches a published standard revision. The archive is not converted for execution.
+      security: [{ SessionCookie: [], CSRF: [] }]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary, description: ZIP with root problem.xml; up to 64 MiB }
+      responses:
+        '201': { description: Imported problem_id, revision_id, contest_problem_id and package report }
+        '403': { description: Contest management permission required }
+        '413': { description: Archive too large }
+        '422': { description: Invalid Polygon archive }
+  /contests/{id}/problems/{problemId}:
+    parameters: [{ $ref: '#/components/parameters/ID' }, { name: problemId, in: path, required: true, schema: { type: string, format: uuid } }]
+    get:
+      operationId: getContestProblem
+      responses: { '200': { description: Participant-safe task and allowed statement data } }
+    patch:
+      operationId: switchContestProblemRevision
+      security: [{ SessionCookie: [], CSRF: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, required: [problem_revision_id], properties: { problem_revision_id: { type: string, format: uuid } } }
+      responses: { '204': { description: Revision switched explicitly } }
+    delete:
+      operationId: detachContestProblem
+      security: [{ SessionCookie: [], CSRF: [] }]
+      responses: { '204': { description: Detached without deleting history } }
+  /problems:
+    get:
+      operationId: listProblems
+      responses: { '200': { description: Authorized problems } }
+    post:
+      operationId: createProblem
+      security: [{ SessionCookie: [], CSRF: [] }]
+      requestBody: { $ref: '#/components/requestBodies/TitleInput' }
+      responses: { '201': { description: Problem created } }
+  /problems/import/polygon:
+    post:
+      operationId: inspectPolygonPackage
+      security: [{ SessionCookie: [], CSRF: [] }]
+      requestBody:
+        content:
+          multipart/form-data:
+            schema: { type: object, required: [file], properties: { file: { type: string, format: binary } } }
+      responses: { '200': { description: Compatibility report; import not claimed } }
+  /problems/{id}/revisions:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    get:
+      operationId: listProblemRevisions
+      responses: { '200': { description: Immutable revision history } }
+    post:
+      operationId: createProblemRevision
+      security: [{ SessionCookie: [], CSRF: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, required: [execution_format], properties: { execution_format: { enum: [standard, scripted_lua] }, clone_from: { type: string, format: uuid }, grader_mode: { enum: [manual, automatic_submission] } } }
+      responses: { '201': { description: Draft revision } }
+  /problems/{id}/revisions/{revisionId}/statements:
+    parameters: [{ $ref: '#/components/parameters/ID' }, { name: revisionId, in: path, required: true, schema: { type: string, format: uuid } }]
+    get:
+      operationId: listRevisionStatements
+      responses:
+        '200': { description: Rendered statements; Markdown source is included only for editors }
+  /problems/{id}/revisions/{revisionId}/statements/{locale}:
+    parameters: [{ $ref: '#/components/parameters/ID' }, { name: revisionId, in: path, required: true, schema: { type: string, format: uuid } }, { name: locale, in: path, required: true, schema: { type: string } }]
+    put:
+      operationId: updateDraftStatement
+      security: [{ SessionCookie: [], CSRF: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, required: [source], properties: { source: { type: string, maxLength: 65536 } } }
+      responses: { '200': { description: Rendered draft statement } }
+  /problems/{id}/revisions/{revisionId}/package:
+    parameters: [{ $ref: '#/components/parameters/ID' }, { name: revisionId, in: path, required: true, schema: { type: string, format: uuid } }]
+    put:
+      operationId: uploadScriptedPackage
+      description: Upload a ZIP up to 16 MiB with a non-empty runner.lua at its root.
+      security: [{ SessionCookie: [], CSRF: [] }]
+      requestBody:
+        content:
+          multipart/form-data:
+            schema: { type: object, required: [file], properties: { file: { type: string, format: binary } } }
+      responses: { '204': { description: Package stored privately }, '413': { description: Package too large }, '422': { description: Invalid archive or unsupported execution format } }
+  /problems/{id}/revisions/{revisionId}/validate:
+    parameters: [{ $ref: '#/components/parameters/ID' }, { name: revisionId, in: path, required: true, schema: { type: string, format: uuid } }]
+    post:
+      operationId: validateProblemRevision
+      security: [{ SessionCookie: [], CSRF: [] }]
+      responses: { '200': { description: Validation report with compatibility warnings } }
+  /problems/{id}/revisions/{revisionId}/publish:
+    parameters: [{ $ref: '#/components/parameters/ID' }, { name: revisionId, in: path, required: true, schema: { type: string, format: uuid } }]
+    post:
+      operationId: publishProblemRevision
+      security: [{ SessionCookie: [], CSRF: [] }]
+      responses: { '204': { description: Immutable revision published } }
+  /contests/{id}/materials:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    get:
+      operationId: listContestMaterials
+      responses: { '200': { description: Visible fixed material revisions } }
+    post:
+      operationId: attachMaterialRevision
+      security: [{ SessionCookie: [], CSRF: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, required: [material_id, material_revision_id, position, visibility], properties: { material_id: { type: string, format: uuid }, material_revision_id: { type: string, format: uuid }, position: { type: integer, minimum: 0 }, visibility: { enum: [contest, managers] } } }
+      responses: { '204': { description: Attached } }
+  /materials:
+    post:
+      operationId: createMaterial
+      security: [{ SessionCookie: [], CSRF: [] }]
+      requestBody: { $ref: '#/components/requestBodies/TitleInput' }
+      responses: { '201': { description: Material created } }
+  /materials/render:
+    post:
+      operationId: renderMaterialPreview
+      security: [{ SessionCookie: [], CSRF: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, required: [format, source], properties: { format: { enum: [markdown, latex] }, source: { type: string, maxLength: 65536 } } }
+      responses: { '200': { description: Sanitized HTML and renderer digest } }
+  /materials/{id}/revisions:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    post:
+      operationId: createMaterialRevision
+      security: [{ SessionCookie: [], CSRF: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, required: [format, source], properties: { format: { enum: [markdown, latex] }, source: { type: string, maxLength: 65536 } } }
+      responses: { '201': { description: Independent immutable material revision } }
+  /contests/{id}/problems/{problemId}/submissions:
+    parameters: [{ $ref: '#/components/parameters/ID' }, { name: problemId, in: path, required: true, schema: { type: string, format: uuid } }]
+    post:
+      operationId: submitSource
+      security: [{ SessionCookie: [], CSRF: [] }]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema: { type: object, required: [source, language], properties: { source: { type: string, format: binary }, language: { type: string } } }
+      responses:
+        '202': { description: Submission, attempt, queue entry, and outbox committed transactionally }
+        '409': { $ref: '#/components/responses/Error' }
+  /submissions:
+    get:
+      operationId: listMySubmissions
+      responses: { '200': { description: Own submissions only } }
+  /submissions/{id}:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    get:
+      operationId: getSubmission
+      responses: { '200': { description: Participant-safe result and attempts } }
+  /submissions/{id}/attempts:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    get:
+      operationId: listJudgingAttempts
+      responses: { '200': { description: Verdict-filtered immutable attempts } }
+  /submissions/{id}/rejudge:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    post:
+      operationId: rejudgeSubmission
+      security: [{ SessionCookie: [], CSRF: [] }]
+      responses: { '202': { description: New attempt created; previous attempts retained } }
+  /contests/{id}/scoreboard:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    get:
+      operationId: getScoreboard
+      responses: { '200': { description: Current published score snapshot or default base scores } }
+  /contests/{id}/scoreboard/me:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    get:
+      operationId: getMyScoreboardRow
+      responses: { '200': { description: Current user's own row } }
+  /contests/{id}/problems/{problemId}/grader-runs:
+    parameters: [{ $ref: '#/components/parameters/ID' }, { name: problemId, in: path, required: true, schema: { type: string, format: uuid } }]
+    post:
+      operationId: createGraderRun
+      security: [{ SessionCookie: [], CSRF: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, required: [mode], properties: { mode: { enum: [preview, publish] } } }
+      responses: { '202': { description: Run has an immutable snapshot and scoped capability } }
+  /grader-runs/{id}:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    get:
+      operationId: getGraderRun
+      responses: { '200': { description: Manager-visible run status } }
+  /grader-runs/{id}/publish:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    post:
+      operationId: publishGraderRun
+      security: [{ SessionCookie: [], CSRF: [] }]
+      responses: { '200': { description: New immutable publication atomically selected } }
+components:
+  securitySchemes:
+    SessionCookie: { type: apiKey, in: cookie, name: podtest_session }
+    CSRF: { type: apiKey, in: header, name: X-CSRF-Token }
+  parameters:
+    ID: { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    After: { name: after, in: query, schema: { type: string, format: uuid } }
+  requestBodies:
+    TitleInput:
+      required: true
+      content:
+        application/json:
+          schema: { type: object, required: [title], properties: { title: { type: string, minLength: 1, maxLength: 200 }, description: { type: string, maxLength: 16000 } } }
+  responses:
+    Error:
+      description: Structured API error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ContestSettings:
+      description: Settings
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ContestSettings' }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties: { code: { type: string }, message: { type: string }, request_id: { type: string } }
+    ContestSettings:
+      type: object
+      required: [status, self_registration, scoreboard_visibility]
+      properties:
+        status: { enum: [draft, open, closed] }
+        starts_at: { type: [string, 'null'], format: date-time }
+        ends_at: { type: [string, 'null'], format: date-time }
+        self_registration: { type: boolean }
+        scoreboard_visibility: { enum: [private, contest] }
+        max_queued_submissions: { type: [integer, 'null'], minimum: 1 }

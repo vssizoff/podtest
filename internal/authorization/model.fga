@@ -1,0 +1,65 @@
+model
+  schema 1.1
+
+type user
+
+type course
+  relations
+    define owner: [user]
+    define manager: [user] or owner
+    define teacher: [user] or manager
+    define student: [user]
+    define viewer: [user] or student or teacher
+    define can_view: viewer
+    define can_edit: teacher
+    define can_manage: manager
+
+type contest
+  relations
+    define manager: [user]
+    define participant: [user]
+    define viewer: [user] or participant or manager
+    define course: [course]
+    define inherited_manager: manager from course
+    define can_view: viewer or inherited_manager
+    define can_edit: manager or inherited_manager
+    define can_manage: manager or inherited_manager
+    define can_submit: participant
+    define can_view_results: participant or can_manage
+    define can_view_full_verdict: can_manage
+
+type problem
+  relations
+    define owner: [user]
+    define editor: [user] or owner
+    define viewer: [user] or editor
+    define can_view: viewer
+    define can_edit: editor
+    define can_manage: owner
+
+type contest_problem
+  relations
+    define contest: [contest]
+    define problem: [problem]
+    define can_view: can_view from contest
+    define can_edit: can_manage from contest or can_edit from problem
+    define can_manage: can_manage from contest
+    define can_submit: can_submit from contest
+    define can_view_results: can_view_results from contest
+    define can_view_full_verdict: can_view_full_verdict from contest
+
+type material
+  relations
+    define owner: [user]
+    define contest: [contest]
+    define can_view: owner
+    define can_edit: owner
+    define can_manage: owner
+
+type submission
+  relations
+    define owner: [user]
+    define contest: [contest]
+    define can_view: owner or can_manage from contest
+    define can_view_results: owner or can_manage from contest
+    define can_view_full_verdict: can_view_full_verdict from contest

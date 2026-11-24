@@ -1,0 +1,20 @@
+issuer: http://localhost:8088/dex
+storage:
+  type: memory
+web:
+  http: 0.0.0.0:5556
+oauth2:
+  skipApprovalScreen: true
+  alwaysShowLoginScreen: false
+enablePasswordDB: true
+staticClients:
+  - id: podtest-local
+    name: Podtest local
+    secret: podtest-local-client
+    redirectURIs:
+      - http://localhost:8088/auth/callback
+staticPasswords:
+  - email: smoke@podtest.test
+    username: Smoke User
+    userID: podtest-smoke
+    hash: '$2y$10$I2s1W3CW0KrRqhxC1Wz7nexxKMwosccHum34bO1k5KPlhxqCtQyVq'

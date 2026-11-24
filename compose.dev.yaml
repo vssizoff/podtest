@@ -1,0 +1,18 @@
+services:
+  nginx:
+    volumes:
+      - ./deploy/nginx-dex.dev.inc:/etc/nginx/dev.d/dex.conf:ro,Z
+
+  dex:
+    image: docker.io/dexidp/dex:v2.44.0
+    command: [dex, serve, /etc/dex/config.yaml]
+    volumes:
+      - ./deploy/dex.dev.yaml:/etc/dex/config.yaml:ro,Z
+    networks: [edge]
+    restart: unless-stopped
+
+  backend-api:
+    environment:
+      OIDC_DEV_DIAL_ADDR: dex:5556
+    depends_on:
+      dex: {condition: service_started}
