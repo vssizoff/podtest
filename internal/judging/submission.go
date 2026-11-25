@@ -114,8 +114,8 @@ func createAttempt(ctx context.Context, tx pgx.Tx, id, contest, participant, rev
 }
 func enqueue(ctx context.Context, tx pgx.Tx, attempt string) error {
 	_, err := tx.Exec(ctx, `INSERT INTO outbox_events(topic,dedup_key,payload)
- SELECT 'podtest.judging.jobs.v1',j.id::text,jsonb_build_object('job_id',j.id,'run_id',j.run_id,'judging_attempt_id',j.id,'submission_id',s.id,'contest_id',s.contest_id,'contest_problem_id',s.contest_problem_id,'problem_id',s.problem_id,'problem_revision_id',r.id,'execution_format',r.execution_format,'format_version',r.format_version,'runner_api_version',r.runner_api_version,'language',l.code,'source',jsonb_build_object('id',src.id,'digest',src.digest),'bundle',jsonb_build_object('id',b.id,'digest',b.digest),'resource_policy',jsonb_build_object('max_score',j.max_score::text),'schema_version',1)
- FROM judging_attempts j JOIN submissions s ON s.id=j.submission_id JOIN problem_revisions r ON r.id=j.target_problem_revision_id JOIN artifacts src ON src.id=s.source_artifact_id JOIN artifacts b ON b.id=r.bundle_artifact_id JOIN languages l ON l.id=s.language_id WHERE j.id=$1`, attempt)
+ SELECT $2,j.id::text,jsonb_build_object('job_id',j.id,'run_id',j.run_id,'judging_attempt_id',j.id,'submission_id',s.id,'contest_id',s.contest_id,'contest_problem_id',s.contest_problem_id,'task_id',s.problem_id,'task_revision_id',r.id,'execution_format',r.execution_format,'execution_format_version',r.format_version,'created_at',to_char(j.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),'schema_version',1)
+ FROM judging_attempts j JOIN submissions s ON s.id=j.submission_id JOIN problem_revisions r ON r.id=j.target_problem_revision_id WHERE j.id=$1`, attempt, Subject)
 	return err
 }
 func (s Submissions) Rejudge(ctx context.Context, user, id, revision string) (out string, err error) {

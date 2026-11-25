@@ -20,7 +20,7 @@ func RunWorker(ctx context.Context, pool *pgxpool.Pool, url string) error {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 		for {
-			if err := finishUnavailable(ctx, pool, true); err != nil && ctx.Err() == nil {
+			if err := finishWithoutInvoker(ctx, pool); err != nil && ctx.Err() == nil {
 				slog.Error("no-invoker judging", "error", err)
 			}
 			select {
@@ -51,9 +51,10 @@ func RunWorker(ctx context.Context, pool *pgxpool.Pool, url string) error {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
-		if err := finishUnavailable(ctx, pool, false); err != nil && ctx.Err() == nil {
-			slog.Error("unavailable judging package", "error", err)
-		} else if err := dispatch(ctx, pool, js); err != nil && ctx.Err() == nil {
+		if err := recoverExpired(ctx, pool); err != nil && ctx.Err() == nil {
+			slog.Error("expired judging lease recovery", "error", err)
+		}
+		if err := dispatch(ctx, pool, js); err != nil && ctx.Err() == nil {
 			slog.Error("judging outbox", "error", err)
 		}
 		select {
@@ -64,10 +65,37 @@ func RunWorker(ctx context.Context, pool *pgxpool.Pool, url string) error {
 	}
 }
 
-func finishUnavailable(ctx context.Context, pool *pgxpool.Pool, noInvoker bool) error {
+// recoverExpired retires the queue reservation without fabricating a verdict.
+// Keep the lease identity so exact replays of committed events can still ACK.
+func recoverExpired(ctx context.Context, pool *pgxpool.Pool) error {
+	return db.Tx(ctx, pool, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT id FROM judging_attempts
+			WHERE status IN ('assigned','running') AND lease_until IS NOT NULL AND lease_until<=clock_timestamp()
+			ORDER BY lease_until,id LIMIT 32 FOR UPDATE SKIP LOCKED`)
+		if err != nil {
+			return err
+		}
+		ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return err
+		}
+		for _, id := range ids {
+			if _, err := tx.Exec(ctx, `UPDATE judging_attempts SET status='recovery' WHERE id=$1`, id); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE queue_entries SET status='done' WHERE attempt_id=$1 AND status='assigned'`, id); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func finishWithoutInvoker(ctx context.Context, pool *pgxpool.Pool) error {
 	return db.Tx(ctx, pool, func(tx pgx.Tx) error {
 		var id string
-		err := tx.QueryRow(ctx, `SELECT j.id FROM judging_attempts j JOIN queue_entries q ON q.attempt_id=j.id JOIN problem_revisions r ON r.id=j.target_problem_revision_id WHERE j.status IN ('waiting','queued') AND q.status IN ('waiting','queued') AND ($1 OR r.manifest->'execution_ready'='false'::jsonb) ORDER BY j.created_at,j.id LIMIT 1 FOR UPDATE OF j,q SKIP LOCKED`, noInvoker).Scan(&id)
+		query := `SELECT j.id FROM judging_attempts j JOIN queue_entries q ON q.attempt_id=j.id WHERE j.status IN ('waiting','queued') AND q.status IN ('waiting','queued') ORDER BY j.created_at,j.id LIMIT 1 FOR UPDATE OF j,q SKIP LOCKED`
+		err := tx.QueryRow(ctx, query).Scan(&id)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
@@ -80,10 +108,7 @@ func finishUnavailable(ctx context.Context, pool *pgxpool.Pool, noInvoker bool) 
 		if _, err = tx.Exec(ctx, `UPDATE queue_entries SET status='done' WHERE attempt_id=$1`, id); err != nil {
 			return err
 		}
-		message := "The problem package is not ready for execution"
-		if noInvoker {
-			message = "No execution Invoker is configured"
-		}
+		const message = "No execution Invoker is configured"
 		_, err = tx.Exec(ctx, `INSERT INTO judging_events(event_id,attempt_id,run_id,sequence,schema_version,kind,payload,occurred_at) SELECT gen_random_uuid(),id,run_id,last_sequence,1,'attempt_finished',jsonb_build_object('status','error','verdict','testing_error','message',$2::text),now() FROM judging_attempts WHERE id=$1`, id, message)
 		return err
 	})
@@ -108,7 +133,7 @@ func dispatch(ctx context.Context, pool *pgxpool.Pool, js nats.JetStreamContext)
 		}
 		var id, topic, dedup string
 		var data []byte
-		err = tx.QueryRow(ctx, `SELECT e.id,e.topic,e.dedup_key,e.payload FROM outbox_events e JOIN queue_entries q ON q.attempt_id::text=e.dedup_key JOIN judging_attempts j ON j.id=q.attempt_id JOIN problem_revisions r ON r.id=j.target_problem_revision_id WHERE e.published_at IS NULL AND q.status='queued' AND r.manifest->'execution_ready' IS DISTINCT FROM 'false'::jsonb ORDER BY e.created_at,e.id LIMIT 1 FOR UPDATE OF e SKIP LOCKED`).Scan(&id, &topic, &dedup, &data)
+		err = tx.QueryRow(ctx, `SELECT e.id,e.topic,e.dedup_key,e.payload FROM outbox_events e JOIN queue_entries q ON q.attempt_id::text=e.dedup_key JOIN judging_attempts j ON j.id=q.attempt_id JOIN problem_revisions r ON r.id=j.target_problem_revision_id WHERE e.published_at IS NULL AND q.status='queued' AND j.status='queued' AND r.manifest->'execution_ready'='true'::jsonb ORDER BY e.created_at,e.id LIMIT 1 FOR UPDATE OF e SKIP LOCKED`).Scan(&id, &topic, &dedup, &data)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}

@@ -58,6 +58,9 @@ func run() error {
 	if mode == "storage-init" {
 		return store.Init(ctx)
 	}
+	if mode == "invoker-artifacts" {
+		return serveInvokerArtifacts(ctx, pool, store)
+	}
 	publicURL := strings.TrimRight(os.Getenv("PUBLIC_URL"), "/")
 	provider, err := auth.NewProvider(ctx, os.Getenv("OIDC_ISSUER_URL"), os.Getenv("OIDC_CLIENT_ID"), os.Getenv("OIDC_CLIENT_SECRET"), publicURL+"/auth/callback")
 	if err != nil {

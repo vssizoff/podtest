@@ -1,15 +1,12 @@
 package problem
 
 import (
-	"archive/zip"
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
-	"sort"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -201,20 +198,22 @@ func (m Manager) SetPackage(ctx context.Context, user, problem, rev string, data
 }
 
 type revisionManifest struct {
-	Format        string            `json:"execution_format"`
-	FormatVersion int               `json:"format_version"`
-	RunnerVersion int               `json:"runner_api_version"`
-	Source        string            `json:"source_sha256"`
-	Statements    map[string]string `json:"statements"`
-	Languages     []string          `json:"languages"`
-	GraderMode    *string           `json:"grader_mode"`
+	Format         string            `json:"execution_format"`
+	FormatVersion  int               `json:"format_version"`
+	RunnerVersion  int               `json:"runner_api_version"`
+	Source         string            `json:"source_sha256"`
+	Statements     map[string]string `json:"statements"`
+	Languages      []string          `json:"languages"`
+	GraderMode     *string           `json:"grader_mode"`
+	PackageFormat  string            `json:"package_format"`
+	ExecutionReady bool              `json:"execution_ready"`
 }
 
 func (m Manager) Validate(ctx context.Context, problem, rev string) error {
 	return db.Tx(ctx, m.Pool, func(tx pgx.Tx) error { _, _, err := manifest(ctx, tx, problem, rev); return err })
 }
 func manifest(ctx context.Context, tx pgx.Tx, problem, rev string) (revisionManifest, string, error) {
-	out := revisionManifest{Statements: map[string]string{}}
+	out := revisionManifest{Statements: map[string]string{}, PackageFormat: "ustar_v1"}
 	var sourceID *string
 	var sourceDigest *string
 	if err := draft(ctx, tx, problem, rev); err != nil {
@@ -285,26 +284,11 @@ func (m Manager) Publish(ctx context.Context, user, problem, rev string) error {
 			return ErrInvalid
 		}
 		files["podtest-manifest.json"] = data
-		var buf bytes.Buffer
-		zw := zip.NewWriter(&buf)
-		names := make([]string, 0, len(files))
-		for name := range files {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		for _, name := range names {
-			w, err := zw.Create(name)
-			if err != nil {
-				return err
-			}
-			if _, err = w.Write(files[name]); err != nil {
-				return err
-			}
-		}
-		if err = zw.Close(); err != nil {
+		bundle, err := buildRevisionBundle(manifest, files)
+		if err != nil {
 			return err
 		}
-		ref, err := m.Artifacts.PutTx(ctx, tx, user, "revision-bundle", "application/zip", buf.Bytes())
+		ref, err := m.Artifacts.PutTx(ctx, tx, user, "revision-bundle", "application/x-tar", bundle)
 		if err != nil {
 			return err
 		}
@@ -313,6 +297,21 @@ func (m Manager) Publish(ctx context.Context, user, problem, rev string) error {
 		}
 		return db.Audit(ctx, tx, user, "revision.publish", rev)
 	})
+}
+
+func buildRevisionBundle(manifest revisionManifest, files map[string][]byte) ([]byte, error) {
+	if len(files["runner.lua"]) == 0 {
+		return nil, ErrMissingRunner
+	}
+	normalized := make([]artifact.BundleFile, 0, len(files))
+	for name, data := range files {
+		normalized = append(normalized, artifact.BundleFile{Path: name, Data: data})
+	}
+	bundle, _, err := artifact.BuildBundle(manifest.Format, uint32(manifest.FormatVersion), uint32(manifest.RunnerVersion), normalized)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrArchive, err)
+	}
+	return bundle, nil
 }
 
 type ContestProblem struct {
