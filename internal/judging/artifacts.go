@@ -22,7 +22,7 @@ import (
 	pb "podtest/internal/invokerpb"
 )
 
-// ArtifactControl only serves already assigned attempts. It is not a scheduler.
+// ArtifactControl grants fenced leases and serves execution inputs and reports.
 type ArtifactControl struct {
 	pb.UnimplementedControlServer
 	Pool  *pgxpool.Pool
@@ -91,7 +91,7 @@ func ttl(expires time.Time) (time.Duration, error) {
 }
 
 func (s *ArtifactControl) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.ClaimResponse, error) {
-	return s.inputs(ctx, &pb.RunLease{AttemptId: req.AttemptId, RunId: req.RunId, InvokerId: req.InvokerId, ProcessEpoch: req.ProcessEpoch}, true)
+	return s.inputs(ctx, &pb.RunLease{AttemptId: req.GetAttemptId(), RunId: req.GetRunId(), InvokerId: req.GetInvokerId(), ProcessEpoch: req.GetProcessEpoch()}, true)
 }
 
 func (s *ArtifactControl) RefreshArtifacts(ctx context.Context, req *pb.RunLease) (*pb.ClaimResponse, error) {
@@ -101,6 +101,11 @@ func (s *ArtifactControl) RefreshArtifacts(ctx context.Context, req *pb.RunLease
 func (s *ArtifactControl) inputs(ctx context.Context, req *pb.RunLease, claim bool) (*pb.ClaimResponse, error) {
 	var out pb.ClaimResponse
 	err := db.Tx(ctx, s.Pool, func(tx pgx.Tx) error {
+		if claim {
+			if err := reserveQueuedStandard(ctx, tx, req); err != nil {
+				return err
+			}
+		}
 		lease, err := lockLease(ctx, tx, req, claim)
 		if err != nil {
 			return err

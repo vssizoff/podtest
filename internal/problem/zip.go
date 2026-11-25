@@ -20,7 +20,7 @@ type PolygonReport struct {
 }
 
 func Files(data []byte) (map[string][]byte, error) {
-	return archiveFiles(data, 2048, 16<<20, 64<<20)
+	return archiveFiles(data, 2048, 32<<20, 68<<20)
 }
 
 func archiveFiles(data []byte, entries, fileLimit, totalLimit int) (map[string][]byte, error) {
@@ -68,7 +68,16 @@ func InspectPolygon(data []byte) (PolygonReport, error) {
 	if err != nil {
 		return PolygonReport{}, err
 	}
-	return inspectPolygonFiles(files)
+	report, err := inspectPolygonFiles(files)
+	if err != nil {
+		return report, err
+	}
+	_, _, reason := polygonTestlib(files)
+	report.Compatible = reason == ""
+	if reason != "" {
+		report.Warnings = append(report.Warnings, reason)
+	}
+	return report, nil
 }
 
 func polygonFiles(data []byte) (map[string][]byte, error) {
@@ -90,5 +99,5 @@ func inspectPolygonFiles(files map[string][]byte) (PolygonReport, error) {
 	if len(files["problem.xml"]) > 1<<20 || xml.Unmarshal(files["problem.xml"], &manifest) != nil || len(manifest.Names) == 0 {
 		return PolygonReport{}, ErrPolygon
 	}
-	return PolygonReport{Title: manifest.Names[0].Value, Warnings: []string{"Package metadata detected. Conversion of tests, checkers, and invocation settings is unavailable."}}, nil
+	return PolygonReport{Title: manifest.Names[0].Value, Warnings: []string{}}, nil
 }

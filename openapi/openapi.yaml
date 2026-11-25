@@ -153,7 +153,7 @@ paths:
     parameters: [{ $ref: '#/components/parameters/ID' }]
     post:
       operationId: importContestPolygon
-      description: Retains the original full Polygon ZIP privately and attaches a published standard revision. The archive is not converted for execution.
+      description: Retains the original full Polygon ZIP privately and attaches a published standard revision. Supported C++ testlib packages are converted for execution; other packages return compatibility diagnostics.
       security: [{ SessionCookie: [], CSRF: [] }]
       requestBody:
         required: true

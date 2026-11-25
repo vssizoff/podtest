@@ -92,7 +92,7 @@ func (s Submissions) Submit(ctx context.Context, user, contest, cp, language str
 	})
 	return
 }
-func createAttempt(ctx context.Context, tx pgx.Tx, id, contest, participant, revision, score, user, reason string, cap *int) (string, error) {
+func createAttempt(ctx context.Context, tx pgx.Tx, id, contest, participant, revision, score string, user any, reason string, cap *int) (string, error) {
 	status := "queued"
 	if cap != nil {
 		var n int
@@ -115,7 +115,8 @@ func createAttempt(ctx context.Context, tx pgx.Tx, id, contest, participant, rev
 func enqueue(ctx context.Context, tx pgx.Tx, attempt string) error {
 	_, err := tx.Exec(ctx, `INSERT INTO outbox_events(topic,dedup_key,payload)
  SELECT $2,j.id::text,jsonb_build_object('job_id',j.id,'run_id',j.run_id,'judging_attempt_id',j.id,'submission_id',s.id,'contest_id',s.contest_id,'contest_problem_id',s.contest_problem_id,'task_id',s.problem_id,'task_revision_id',r.id,'execution_format',r.execution_format,'execution_format_version',r.format_version,'created_at',to_char(j.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),'schema_version',1)
- FROM judging_attempts j JOIN submissions s ON s.id=j.submission_id JOIN problem_revisions r ON r.id=j.target_problem_revision_id WHERE j.id=$1`, attempt, Subject)
+ || CASE WHEN r.execution_format='standard' AND r.manifest->'execution_ready'='true'::jsonb THEN jsonb_build_object('language',l.code) ELSE '{}'::jsonb END
+ FROM judging_attempts j JOIN submissions s ON s.id=j.submission_id JOIN languages l ON l.id=s.language_id JOIN problem_revisions r ON r.id=j.target_problem_revision_id WHERE j.id=$1`, attempt, Subject)
 	return err
 }
 func (s Submissions) Rejudge(ctx context.Context, user, id, revision string) (out string, err error) {

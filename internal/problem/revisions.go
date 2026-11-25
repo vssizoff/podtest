@@ -19,9 +19,9 @@ import (
 
 var ErrInvalid = errors.New("invalid revision configuration")
 var ErrNotDraft = errors.New("revision is not a draft")
-var ErrUnsupported = errors.New("standard executor bundle adapter not available")
+var ErrUnsupported = errors.New("unsupported revision execution format")
 var ErrMissingRunner = errors.New("ZIP must contain a non-empty runner.lua at its root")
-var ErrMissingPackage = errors.New("upload a scripted Lua ZIP before publishing")
+var ErrMissingPackage = errors.New("upload an execution package before publishing")
 var ErrIncomplete = errors.New("save a statement and enable at least one language before publishing")
 var ErrReservedFile = errors.New("podtest-manifest.json is reserved; remove it from the uploaded ZIP")
 
@@ -171,15 +171,21 @@ func (m Manager) SetPackage(ctx context.Context, user, problem, rev string, data
 	if err := m.Pool.QueryRow(ctx, `SELECT execution_format FROM problem_revisions WHERE id=$1 AND problem_id=$2 AND status='draft'`, rev, problem).Scan(&format); err != nil {
 		return err
 	}
-	if format != "scripted_lua" {
-		return ErrUnsupported
-	}
 	files, err := Files(data)
 	if err != nil {
 		return err
 	}
-	if len(files["runner.lua"]) == 0 {
-		return ErrMissingRunner
+	switch format {
+	case "standard":
+		if _, err := validateStandard(files); err != nil {
+			return err
+		}
+	case "scripted_lua":
+		if len(files["runner.lua"]) == 0 {
+			return ErrMissingRunner
+		}
+	default:
+		return ErrUnsupported
 	}
 	if _, exists := files["podtest-manifest.json"]; exists {
 		return ErrReservedFile
@@ -210,7 +216,14 @@ type revisionManifest struct {
 }
 
 func (m Manager) Validate(ctx context.Context, problem, rev string) error {
-	return db.Tx(ctx, m.Pool, func(tx pgx.Tx) error { _, _, err := manifest(ctx, tx, problem, rev); return err })
+	return db.Tx(ctx, m.Pool, func(tx pgx.Tx) error {
+		meta, source, err := manifest(ctx, tx, problem, rev)
+		if err != nil || meta.Format != "standard" {
+			return err
+		}
+		_, err = m.packageFiles(ctx, source, &meta)
+		return err
+	})
 }
 func manifest(ctx context.Context, tx pgx.Tx, problem, rev string) (revisionManifest, string, error) {
 	out := revisionManifest{Statements: map[string]string{}, PackageFormat: "ustar_v1"}
@@ -223,8 +236,11 @@ func manifest(ctx context.Context, tx pgx.Tx, problem, rev string) (revisionMani
 	if err != nil {
 		return out, "", err
 	}
-	if out.Format != "scripted_lua" {
+	if out.Format != "scripted_lua" && out.Format != "standard" {
 		return out, "", ErrUnsupported
+	}
+	if out.Format == "standard" {
+		out.RunnerVersion = 0
 	}
 	if sourceID == nil || sourceDigest == nil {
 		return out, "", ErrMissingPackage
@@ -265,23 +281,13 @@ func (m Manager) Publish(ctx context.Context, user, problem, rev string) error {
 		if err != nil {
 			return err
 		}
-		original, err := m.Artifacts.Read(ctx, source, MaxPackageBytes)
-		if err != nil {
-			return err
-		}
-		if fmt.Sprintf("%x", sha256.Sum256(original)) != manifest.Source {
-			return errors.New("revision source digest mismatch")
-		}
-		files, err := Files(original)
+		files, err := m.packageFiles(ctx, source, &manifest)
 		if err != nil {
 			return err
 		}
 		data, err := json.Marshal(manifest)
 		if err != nil {
 			return err
-		}
-		if _, exists := files["podtest-manifest.json"]; exists {
-			return ErrInvalid
 		}
 		files["podtest-manifest.json"] = data
 		bundle, err := buildRevisionBundle(manifest, files)
@@ -299,8 +305,36 @@ func (m Manager) Publish(ctx context.Context, user, problem, rev string) error {
 	})
 }
 
+func (m Manager) packageFiles(ctx context.Context, source string, meta *revisionManifest) (map[string][]byte, error) {
+	original, err := m.Artifacts.Read(ctx, source, MaxPackageBytes)
+	if err != nil {
+		return nil, err
+	}
+	if fmt.Sprintf("%x", sha256.Sum256(original)) != meta.Source {
+		return nil, errors.New("revision source digest mismatch")
+	}
+	files, err := Files(original)
+	if err != nil {
+		return nil, err
+	}
+	if _, exists := files["podtest-manifest.json"]; exists {
+		return nil, ErrReservedFile
+	}
+	if meta.Format == "standard" {
+		language, err := validateStandard(files)
+		if err != nil {
+			return nil, err
+		}
+		if len(meta.Languages) != 1 || meta.Languages[0] != language {
+			return nil, fmt.Errorf("%w: enable only the language declared in standard.json", ErrInvalid)
+		}
+		meta.ExecutionReady = true
+	}
+	return files, nil
+}
+
 func buildRevisionBundle(manifest revisionManifest, files map[string][]byte) ([]byte, error) {
-	if len(files["runner.lua"]) == 0 {
+	if manifest.Format == "scripted_lua" && len(files["runner.lua"]) == 0 {
 		return nil, ErrMissingRunner
 	}
 	normalized := make([]artifact.BundleFile, 0, len(files))

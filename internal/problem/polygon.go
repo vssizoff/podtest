@@ -36,7 +36,22 @@ func (m Manager) ImportPolygon(ctx context.Context, auth *authorization.Manager,
 	if title == "" || utf8.RuneCountInString(title) > 200 {
 		return out, ErrInvalid
 	}
-	manifest, err := json.Marshal(map[string]any{"execution_format": "standard", "package_format": "polygon_full_zip", "execution_ready": false})
+	normalized, languages, reason := polygonTestlib(files)
+	out.Report.Compatible = reason == ""
+	if reason != "" {
+		out.Report.Warnings = append(out.Report.Warnings, reason)
+	}
+	meta := revisionManifest{Format: "standard", FormatVersion: 1, PackageFormat: "polygon_full_zip"}
+	var bundle []byte
+	if out.Report.Compatible {
+		meta.PackageFormat, meta.ExecutionReady, meta.Languages = "ustar_v1", true, languages
+		bundle, err = buildRevisionBundle(meta, normalized)
+		if err != nil {
+			return out, err
+		}
+	}
+	meta.Source = fmt.Sprintf("%x", sha256.Sum256(data))
+	manifest, err := json.Marshal(meta)
 	if err != nil {
 		return out, err
 	}
@@ -57,12 +72,21 @@ func (m Manager) ImportPolygon(ctx context.Context, auth *authorization.Manager,
 		if err = tx.QueryRow(ctx, `INSERT INTO problem_revisions(problem_id,revision_number,execution_format,source_artifact_id) VALUES($1,1,'standard',$2) RETURNING id`, out.ProblemID, ref.ID).Scan(&out.RevisionID); err != nil {
 			return err
 		}
-		if _, err = tx.Exec(ctx, `INSERT INTO problem_revision_languages(revision_id,language_id) SELECT $1,id FROM languages WHERE builtin`, out.RevisionID); err != nil {
+		if tag, err := tx.Exec(ctx, `INSERT INTO problem_revision_languages(revision_id,language_id) SELECT $1,id FROM languages WHERE builtin AND (NOT $2::boolean OR code=ANY($3::text[]))`, out.RevisionID, out.Report.Compatible, languages); err != nil {
 			return err
+		} else if out.Report.Compatible && tag.RowsAffected() != int64(len(languages)) {
+			return fmt.Errorf("Polygon execution languages are not registered")
 		}
-		source := "The original Polygon package is retained for inspection. This imported revision is not executable until conversion and the Invoker are implemented."
-		rendered := "<p>" + html.EscapeString(source) + "</p>"
-		if _, err = tx.Exec(ctx, `INSERT INTO problem_statements(revision_id,locale,source,rendered_html,renderer_version,digest) VALUES($1,'en',$2,$3,'polygon-placeholder-v1',$4)`, out.RevisionID, source, rendered, fmt.Sprintf("%x", sha256.Sum256([]byte(rendered)))); err != nil {
+		source, locale := "The original Polygon package is retained for inspection. This revision is not executable: "+reason, "en"
+		if out.Report.Compatible {
+			source, locale = polygonPlainStatement(files, title)
+			ref, err = m.Artifacts.PutTx(ctx, tx, user, "revision-bundle", "application/x-tar", bundle)
+			if err != nil {
+				return err
+			}
+		}
+		rendered := "<p>" + strings.ReplaceAll(html.EscapeString(source), "\n", "<br>") + "</p>"
+		if _, err = tx.Exec(ctx, `INSERT INTO problem_statements(revision_id,locale,source,rendered_html,renderer_version,digest) VALUES($1,$2,$3,$4,'polygon-text-v1',$5)`, out.RevisionID, locale, source, rendered, fmt.Sprintf("%x", sha256.Sum256([]byte(rendered)))); err != nil {
 			return err
 		}
 		if _, err = tx.Exec(ctx, `UPDATE problem_revisions SET bundle_artifact_id=$2,digest=$3,manifest=$4,status='published',published_at=now() WHERE id=$1`, out.RevisionID, ref.ID, ref.Digest, manifest); err != nil {
@@ -86,4 +110,20 @@ func (m Manager) ImportPolygon(ctx context.Context, auth *authorization.Manager,
 		_ = auth.SyncCreation(ctx, m.Pool, grant, grantID)
 	}
 	return out, err
+}
+
+func polygonPlainStatement(files map[string][]byte, title string) (string, string) {
+	for _, lang := range []struct{ name, locale string }{{"russian", "ru"}, {"english", "en"}} {
+		parts := []string{title}
+		for _, name := range []string{"legend", "input", "output", "notes"} {
+			data := files["statement-sections/"+lang.name+"/"+name+".tex"]
+			if len(data) > 0 && len(data) <= 64<<10 && utf8.Valid(data) {
+				parts = append(parts, strings.TrimSpace(string(data)))
+			}
+		}
+		if len(parts) > 1 {
+			return strings.Join(parts, "\n\n"), lang.locale
+		}
+	}
+	return title, "en"
 }

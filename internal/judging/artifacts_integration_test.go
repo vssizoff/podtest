@@ -310,6 +310,141 @@ func TestArtifactControlIntegration(t *testing.T) {
 		t.Fatalf("renewal of cancelled run: %v", err)
 	}
 	checkTerminalReport(t, ctx, pool, control, lease, submissionID)
+	checkSuccessfulReport(t, ctx, pool, control, lease, submissionID)
+	checkQueuedStandardClaim(t, ctx, pool, store, control, lease)
+}
+
+func checkQueuedStandardClaim(t *testing.T, ctx context.Context, pool *pgxpool.Pool, store *artifact.Store, control pb.ControlClient, previous *pb.RunLease) {
+	t.Helper()
+	bundle, _, err := artifact.BuildBundle("standard", 1, 0, []artifact.BundleFile{
+		{Path: "standard.json", Data: []byte(`{"version":1,"language":"posix_sh","build":"package_source","checker":"exact_bytes",
+			"limits":{"wall_ms":800,"output_bytes":4096},"groups":[{"id":"main","scoring":"sum"}],
+			"tests":[{"id":"echo","group":"main","input":"tests/input","answer":"tests/answer","points_milli":1000}]}`)},
+		{Path: "tests/input", Data: []byte("fixture\n")},
+		{Path: "tests/answer", Data: []byte("fixture\n")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := store.Put(ctx, "", "revision-bundle", "application/x-tar", bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var revision string
+	err = pool.QueryRow(ctx, `WITH old AS (SELECT r.* FROM problem_revisions r JOIN judging_attempts j ON j.target_problem_revision_id=r.id WHERE j.id=$1),
+		r AS (INSERT INTO problem_revisions(problem_id,revision_number,execution_format,manifest,bundle_artifact_id,digest)
+		SELECT problem_id,revision_number+1,'standard','{"package_format":"ustar_v1","execution_ready":true}',$2,$3 FROM old RETURNING id),
+		st AS (INSERT INTO problem_statements SELECT r.id,s.locale,s.source,s.rendered_html,s.renderer_version,s.digest FROM old JOIN problem_statements s ON s.revision_id=old.id CROSS JOIN r),
+		lang AS (INSERT INTO problem_revision_languages(revision_id,language_id) SELECT r.id,l.language_id FROM old JOIN problem_revision_languages l ON l.revision_id=old.id CROSS JOIN r)
+		SELECT id FROM r`, previous.AttemptId, ref.ID, ref.Digest).Scan(&revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE problem_revisions SET status='published',published_at=now() WHERE id=$1`, revision); err != nil {
+		t.Fatal(err)
+	}
+	create := func(number int) *pb.ClaimRequest {
+		t.Helper()
+		claim := &pb.ClaimRequest{InvokerId: previous.InvokerId, ProcessEpoch: uuid.NewString()}
+		err := pool.QueryRow(ctx, `WITH a AS (INSERT INTO judging_attempts(submission_id,attempt_number,target_problem_revision_id,status,trigger_reason,max_score)
+			SELECT submission_id,$2,$3,'queued','fixture',max_score FROM judging_attempts WHERE id=$1 RETURNING id,run_id,submission_id),
+			q AS (INSERT INTO queue_entries(attempt_id,contest_id,participant_id,status)
+			SELECT a.id,s.contest_id,s.participant_id,'queued' FROM a JOIN submissions s ON s.id=a.submission_id)
+			SELECT id,run_id FROM a`, previous.AttemptId, number, revision).Scan(&claim.AttemptId, &claim.RunId)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return claim
+	}
+	first, second := create(6), create(7)
+	if port := os.Getenv("PODTEST_CLAIM_FIXTURE_PORT"); port != "" {
+		checkStandardAdvertisement(t, ctx, pool, port, first)
+	}
+	if _, err := control.Claim(ctx, first); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("claimed without Standard capacity: %v", err)
+	}
+	if _, err := control.Heartbeat(ctx, &pb.HeartbeatRequest{InvokerId: previous.InvokerId, ProtocolVersion: 1, Capacity: 1, ExecutionFormats: []string{"standard"}}); err != nil {
+		t.Fatal(err)
+	}
+	type claimResult struct {
+		request *pb.ClaimRequest
+		grant   *pb.ClaimResponse
+		err     error
+	}
+	results := make(chan claimResult, 2)
+	start := make(chan struct{})
+	for _, req := range []*pb.ClaimRequest{first, second} {
+		go func() {
+			<-start
+			grant, err := control.Claim(ctx, req)
+			results <- claimResult{req, grant, err}
+		}()
+	}
+	close(start)
+	winner, loser := <-results, <-results
+	if winner.err != nil {
+		winner, loser = loser, winner
+	}
+	if winner.err != nil || len(winner.grant.GetFencingToken()) != 32 || status.Code(loser.err) != codes.ResourceExhausted {
+		t.Fatalf("concurrent Claims did not reserve exactly one slot: winner=%v loser=%v", winner.err, loser.err)
+	}
+	if replayed, err := control.Claim(ctx, winner.request); err != nil || !proto.Equal(winner.grant.GetBundle(), replayed.GetBundle()) || string(winner.grant.GetFencingToken()) != string(replayed.GetFencingToken()) {
+		t.Fatalf("Claim retry changed the lease: %v", err)
+	}
+	stale := proto.CloneOf(winner.request)
+	stale.ProcessEpoch = uuid.NewString()
+	if _, err := control.Claim(ctx, stale); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("a new process epoch took over a live run: %v", err)
+	}
+	if _, err := control.Claim(ctx, loser.request); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("second claim exceeded capacity: %v", err)
+	}
+	var states int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM judging_attempts j JOIN queue_entries q ON q.attempt_id=j.id
+		WHERE (j.id=$1 AND j.status='assigned' AND q.status='assigned') OR (j.id=$2 AND j.status='queued' AND q.status='queued')`, winner.request.AttemptId, loser.request.AttemptId).Scan(&states); err != nil || states != 2 {
+		t.Fatalf("unexpected queue transitions: %d matching rows (%v)", states, err)
+	}
+}
+
+func checkStandardAdvertisement(t *testing.T, ctx context.Context, pool *pgxpool.Pool, port string, claim *pb.ClaimRequest) {
+	t.Helper()
+	nc, err := nats.Connect("nats://127.0.0.1:"+port, nats.Timeout(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := nc.JetStream(nats.MaxWait(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := provisionStandardQueue(ctx, js); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Tx(ctx, pool, func(tx pgx.Tx) error { return enqueue(ctx, tx, claim.AttemptId) }); err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatch(ctx, pool, js); err != nil {
+		t.Fatal(err)
+	}
+	sub, err := js.PullSubscribe(Subject, jobConsumer, nats.Bind(jobStream, jobConsumer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages, err := sub.Fetch(1, nats.MaxWait(time.Second))
+	if err != nil || len(messages) != 1 {
+		t.Fatalf("fetch Standard advertisement: %d messages, %v", len(messages), err)
+	}
+	var job struct {
+		AttemptID string `json:"judging_attempt_id"`
+		RunID     string `json:"run_id"`
+		Format    string `json:"execution_format"`
+	}
+	if err := json.Unmarshal(messages[0].Data, &job); err != nil || job.AttemptID != claim.AttemptId || job.RunID != claim.RunId || job.Format != "standard" {
+		t.Fatalf("unexpected Standard advertisement: %+v (%v)", job, err)
+	}
+	// Leave the message unacknowledged: this helper does not own a lease.
 }
 
 func checkTerminalReport(t *testing.T, ctx context.Context, pool *pgxpool.Pool, control pb.ControlClient, previous *pb.RunLease, submission string) {
@@ -335,8 +470,9 @@ func checkTerminalReport(t *testing.T, ctx context.Context, pool *pgxpool.Pool, 
 			OccurredAtUnixMillis: time.Now().UnixMilli(), Kind: pb.Event_RUN_FINISHED, Outcome: outcome}
 		invalid := proto.CloneOf(event)
 		invalid.Outcome = "success"
-		if _, err := control.Report(ctx, invalid); status.Code(err) != codes.Unimplemented {
-			t.Fatalf("unsupported success report: %v", err)
+		invalid.Verdict = "accepted"
+		if _, err := control.Report(ctx, invalid); status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("successful report without problem score: %v", err)
 		}
 		invalid = proto.CloneOf(event)
 		invalid.FencingToken = make([]byte, 32)
@@ -369,6 +505,66 @@ func checkTerminalReport(t *testing.T, ctx context.Context, pool *pgxpool.Pool, 
 		if err != nil || state != wantState || queued != "done" || sequence != 1 || storedOutcome != outcome {
 			t.Fatalf("terminal Report not committed: state=%s queue=%s sequence=%d outcome=%s err=%v", state, queued, sequence, storedOutcome, err)
 		}
+	}
+}
+
+func checkSuccessfulReport(t *testing.T, ctx context.Context, pool *pgxpool.Pool, control pb.ControlClient, previous *pb.RunLease, submission string) {
+	t.Helper()
+	claim := &pb.ClaimRequest{InvokerId: previous.InvokerId, ProcessEpoch: uuid.NewString()}
+	if err := pool.QueryRow(ctx, `INSERT INTO judging_attempts(submission_id,attempt_number,target_problem_revision_id,status,trigger_reason,invoker_id,lease_until,max_score)
+		SELECT submission_id,5,target_problem_revision_id,'assigned','fixture',invoker_id,clock_timestamp()+interval '2 minutes',1
+		FROM judging_attempts WHERE id=$1 RETURNING id,run_id`, previous.AttemptId).Scan(&claim.AttemptId, &claim.RunId); err != nil {
+		t.Fatal(err)
+	}
+	granted, err := control.Claim(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newEvent := func(kind pb.Event_Kind, sequence uint64) *pb.Event {
+		id := uuid.New()
+		return &pb.Event{EventId: id[:], AttemptId: claim.AttemptId, RunId: claim.RunId, SubmissionId: submission,
+			InvokerId: claim.InvokerId, FencingToken: granted.FencingToken, Sequence: sequence, SchemaVersion: 1,
+			OccurredAtUnixMillis: time.Now().UnixMilli(), Kind: kind}
+	}
+	score := "0.5"
+	test := newEvent(pb.Event_TEST_FINISHED, 1)
+	test.TestId, test.Verdict, test.Score = "test-1", "accepted", &score
+	group := newEvent(pb.Event_SUBGROUP_SCORE, 2)
+	group.SubgroupId, group.Score = "group-1", &score
+	problem := newEvent(pb.Event_PROBLEM_SCORE, 3)
+	problem.Score = &score
+	finish := newEvent(pb.Event_RUN_FINISHED, 4)
+	finish.Outcome, finish.Verdict = "success", "accepted"
+	staleTest := proto.CloneOf(test)
+	staleTest.FencingToken[0] ^= 1
+	if _, err := control.Report(ctx, staleTest); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("stale fence staged a test result: %v", err)
+	}
+	for _, event := range []*pb.Event{test, group, problem} {
+		if ack, err := control.Report(ctx, event); err != nil || ack.GetDuplicate() {
+			t.Fatalf("record result %s: %v", event.Kind, err)
+		}
+	}
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM test_results WHERE attempt_id=$1`, claim.AttemptId).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("partial results exposed: count=%d err=%v", count, err)
+	}
+	if ack, err := control.Report(ctx, finish); err != nil || ack.GetDuplicate() {
+		t.Fatalf("finish successful run: %v", err)
+	}
+	if ack, err := control.Report(ctx, finish); err != nil || !ack.GetDuplicate() {
+		t.Fatalf("success replay: %v", err)
+	}
+	staleFinish := proto.CloneOf(finish)
+	staleFinish.FencingToken[0] ^= 1
+	if _, err := control.Report(ctx, staleFinish); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("stale fence received a duplicate ACK: %v", err)
+	}
+	var valid bool
+	if err := pool.QueryRow(ctx, `SELECT j.status='finished' AND j.verdict='accepted' AND j.base_score=0.5 AND j.last_sequence=4
+		AND t.test_id='test-1' AND t.verdict='accepted' AND t.score=0.5 AND g.subgroup_id='group-1' AND g.score=0.5
+		FROM judging_attempts j JOIN test_results t ON t.attempt_id=j.id JOIN subgroup_results g ON g.attempt_id=j.id WHERE j.id=$1`, claim.AttemptId).Scan(&valid); err != nil || !valid {
+		t.Fatalf("successful results not committed: valid=%v err=%v", valid, err)
 	}
 }
 

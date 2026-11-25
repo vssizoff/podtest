@@ -9,7 +9,8 @@ RUN CGO_ENABLED=0 go build -trimpath -o /backend ./cmd/backend
 FROM docker.io/library/node:26-alpine3.23 AS math
 WORKDIR /app
 COPY frontend/package.json frontend/package-lock.json ./
-RUN npm ci --omit=dev
+ARG NPM_CONFIG_REGISTRY=https://registry.npmjs.org
+RUN npm ci --omit=dev --no-audit
 COPY deploy/math.cjs ./
 
 FROM docker.io/library/node:26-alpine3.23

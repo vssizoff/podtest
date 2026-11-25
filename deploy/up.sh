@@ -13,7 +13,11 @@ compose() { podman-compose "$@"; }
 
 # podman-compose 1.6 maps depends_on to Podman's --requires, including
 # completed jobs. Start each stage explicitly so each job can exit normally.
-compose "$@" build backend-api nginx
+if [ -n "${PODTEST_NPM_REGISTRY:-}" ]; then
+    compose "$@" build --build-arg "NPM_CONFIG_REGISTRY=$PODTEST_NPM_REGISTRY" backend-api nginx
+else
+    compose "$@" build backend-api nginx
+fi
 # The optional service name expands to zero or one arguments.
 compose "$@" up -d --no-build --no-deps postgres nats minio $oidc_service
 compose "$@" run --rm --no-deps db-migrate

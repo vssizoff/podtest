@@ -18,13 +18,16 @@ import (
 	pb "podtest/internal/invokerpb"
 )
 
-// Report accepts finalized artifacts and unsuccessful terminal outcomes.
-// Successful executions and scoring results are not yet supported.
+// Report accepts ordered, fenced execution events and finalized artifacts.
 func (s *ArtifactControl) Report(ctx context.Context, req *pb.Event) (*pb.Acknowledgement, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "missing event")
+	}
 	if err := authenticate(ctx, req.GetInvokerId()); err != nil {
 		return nil, err
 	}
 	var terminalState string
+	var resultKind string
 	switch req.Kind {
 	case pb.Event_ARTIFACT_CREATED:
 		if req.Outcome != "" || !canonicalUUID(req.ArtifactId) {
@@ -36,11 +39,19 @@ func (s *ArtifactControl) Report(ctx context.Context, req *pb.Event) (*pb.Acknow
 			terminalState = "error"
 		case "timeout":
 			terminalState = "timeout"
+		case "success":
+			terminalState = "finished"
 		default:
 			return nil, status.Error(codes.Unimplemented, "unsupported terminal outcome")
 		}
 		if req.ArtifactId != "" {
 			return nil, status.Error(codes.InvalidArgument, "report artifacts separately")
+		}
+	case pb.Event_TEST_FINISHED, pb.Event_SUBGROUP_SCORE, pb.Event_PROBLEM_SCORE:
+		var err error
+		resultKind, err = validateResultReport(req)
+		if err != nil {
+			return nil, err
 		}
 	default:
 		return nil, status.Error(codes.Unimplemented, "unsupported event kind")
@@ -50,8 +61,12 @@ func (s *ArtifactControl) Report(ctx context.Context, req *pb.Event) (*pb.Acknow
 		!canonicalUUID(req.SubmissionId) || len(req.FencingToken) != 32 ||
 		req.SchemaVersion != 1 || req.Sequence == 0 || req.Sequence > math.MaxInt64 ||
 		req.OccurredAtUnixMillis <= 0 || req.OccurredAtUnixMillis > 253402300799999 ||
-		req.Verdict != "" || req.Score != nil || req.TestId != "" || req.SubgroupId != "" || len(req.ProtoReflect().GetUnknown()) != 0 {
+		len(req.ProtoReflect().GetUnknown()) != 0 {
 		return nil, status.Error(codes.InvalidArgument, "invalid run event")
+	}
+	if resultKind == "" && (req.Score != nil || req.TestId != "" || req.SubgroupId != "" ||
+		(terminalState == "finished" && !validReportVerdict(req.Verdict)) || (terminalState != "finished" && req.Verdict != "")) {
+		return nil, status.Error(codes.InvalidArgument, "invalid terminal or artifact fields")
 	}
 	wire, err := (proto.MarshalOptions{Deterministic: true}).Marshal(req)
 	if err != nil {
@@ -98,6 +113,9 @@ func (s *ArtifactControl) Report(ctx context.Context, req *pb.Event) (*pb.Acknow
 		if terminalState != "" {
 			return finishReportedRun(ctx, tx, req, id, digest, terminalState)
 		}
+		if resultKind != "" {
+			return recordResultReport(ctx, tx, req, id, digest, resultKind)
+		}
 		tag, err := tx.Exec(ctx, `INSERT INTO judging_events(event_id,attempt_id,run_id,sequence,schema_version,kind,payload,occurred_at)
 			SELECT $1,g.attempt_id,g.run_id,$4,1,'artifact_created',jsonb_build_object('artifact_id',g.id,'kind',g.kind,'report_digest',$5::text),$6
 			FROM invoker_upload_grants g JOIN attempt_artifacts a ON a.attempt_id=g.attempt_id AND a.artifact_id=g.id AND a.kind=g.kind
@@ -121,6 +139,11 @@ func (s *ArtifactControl) Report(ctx context.Context, req *pb.Event) (*pb.Acknow
 }
 
 func finishReportedRun(ctx context.Context, tx pgx.Tx, req *pb.Event, id uuid.UUID, digest, state string) error {
+	if state == "finished" {
+		if err := publishReportedResults(ctx, tx, req); err != nil {
+			return err
+		}
+	}
 	tag, err := tx.Exec(ctx, `INSERT INTO judging_events(event_id,attempt_id,run_id,sequence,schema_version,kind,payload,occurred_at)
 		VALUES($1,$2,$3,$4,1,'attempt_finished',jsonb_build_object('status',$5::text,'outcome',$6::text,'report_digest',$7::text),$8)
 		ON CONFLICT DO NOTHING`, id, req.AttemptId, req.RunId, int64(req.Sequence), state, req.Outcome, digest, time.UnixMilli(req.OccurredAtUnixMillis))
@@ -130,7 +153,8 @@ func finishReportedRun(ctx context.Context, tx pgx.Tx, req *pb.Event, id uuid.UU
 	if tag.RowsAffected() != 1 {
 		return status.Error(codes.AlreadyExists, "event identity already bound")
 	}
-	tag, err = tx.Exec(ctx, `UPDATE judging_attempts SET status=$2,finished_at=clock_timestamp(),last_sequence=$3
+	tag, err = tx.Exec(ctx, `UPDATE judging_attempts SET status=$2,finished_at=clock_timestamp(),last_sequence=$3,
+		verdict=CASE WHEN $2='error' THEN 'testing_error' ELSE verdict END
 		WHERE id=$1 AND lease_until>clock_timestamp()`, req.AttemptId, state, int64(req.Sequence))
 	if err != nil {
 		return err

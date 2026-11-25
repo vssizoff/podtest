@@ -1,7 +1,8 @@
 FROM docker.io/library/node:26-alpine3.23 AS build
 WORKDIR /app
 COPY frontend/package.json frontend/package-lock.json ./
-RUN npm ci
+ARG NPM_CONFIG_REGISTRY=https://registry.npmjs.org
+RUN npm ci --no-audit
 COPY frontend/ ./
 RUN npm run build
 

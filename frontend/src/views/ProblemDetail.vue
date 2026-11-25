@@ -115,7 +115,7 @@ const publish = () => run(async () => {
         </form>
         <TermButton variant="primary" :disabled="busy" @click="publish">Validate and publish</TermButton>
       </template>
-      <p v-else-if="revision.status === 'draft' && revision.execution_format === 'standard'" class="muted">Standard / Polygon publishing is not implemented yet.</p>
+      <p v-else-if="revision.status === 'draft' && revision.execution_format === 'standard'" class="muted">Standard draft editing is available through the API.</p>
       <article v-for="statement in statements" :key="statement.locale" class="material-entry">
         <h3>Statement · {{ statement.locale }}</h3><div class="rendered-document" v-html="statement.html" />
       </article>

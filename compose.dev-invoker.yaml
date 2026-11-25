@@ -1,0 +1,31 @@
+services:
+  backend-api:
+    environment:
+      S3_URL: https://minio:9000
+      SSL_CERT_FILE: /run/podtest-dev/ca.crt
+    volumes:
+      - ${PODTEST_DEV_DIR:?set PODTEST_DEV_DIR}/ca.crt:/run/podtest-dev/ca.crt:ro,z
+  backend-worker:
+    environment:
+      JUDGING_NO_INVOKER: 'false'
+  storage-init:
+    environment:
+      S3_URL: https://minio:9000
+      SSL_CERT_FILE: /run/podtest-dev/ca.crt
+    volumes:
+      - ${PODTEST_DEV_DIR:?set PODTEST_DEV_DIR}/ca.crt:/run/podtest-dev/ca.crt:ro,z
+  postgres:
+    networks: [data, invoker-dev]
+    ports: ['127.0.0.1:15432:5432']
+  nats:
+    networks: [data, invoker-dev]
+    ports: ['127.0.0.1:14222:4222']
+  minio:
+    command: [--certs-dir, /run/podtest-dev, server, /data]
+    volumes:
+      - ${PODTEST_DEV_DIR:?set PODTEST_DEV_DIR}/minio:/run/podtest-dev:ro,Z
+    networks: [data, invoker-dev]
+    ports: ['127.0.0.1:19000:9000']
+
+networks:
+  invoker-dev: {}
