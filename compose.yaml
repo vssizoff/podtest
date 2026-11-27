@@ -17,6 +17,7 @@ x-backend: &backend
     FGA_STATE_FILE: /fga/state.json
     NATS_URL: nats://nats:4222
     JUDGING_NO_INVOKER: ${JUDGING_NO_INVOKER:-false}
+    JUDGING_ENABLE_LUA: ${JUDGING_ENABLE_LUA:-false}
     S3_URL: http://minio:9000
     S3_BUCKET: ${S3_BUCKET:-podtest}
     S3_ACCESS_KEY: ${S3_ACCESS_KEY}

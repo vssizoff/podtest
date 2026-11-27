@@ -21,9 +21,10 @@ func (s *ArtifactControl) RenewLease(ctx context.Context, req *pb.RunLease) (*pb
 		// Bound the extension relative to the database clock so retries cannot
 		// accumulate lease time and an early renewal never shortens the grant.
 		err := tx.QueryRow(ctx, `UPDATE judging_attempts
-			SET lease_until=greatest(lease_until,clock_timestamp()+interval '2 minutes')
+			SET lease_until=CASE WHEN cancel_requested_at IS NULL
+				THEN greatest(lease_until,clock_timestamp()+interval '2 minutes') ELSE lease_until END
 			WHERE id=$1 AND lease_until>clock_timestamp()
-			RETURNING floor(extract(epoch FROM lease_until))::bigint`, req.AttemptId).Scan(&out.LeaseExpiresUnix)
+			RETURNING floor(extract(epoch FROM lease_until))::bigint,cancel_requested_at IS NOT NULL`, req.AttemptId).Scan(&out.LeaseExpiresUnix, &out.CancelRequested)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return status.Error(codes.FailedPrecondition, "run lease expired")
 		}

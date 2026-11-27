@@ -8,6 +8,134 @@ servers:
 security:
   - SessionCookie: []
 paths:
+  /problems/{id}/revisions/{revisionId}/package/files:
+    parameters: [{ $ref: '#/components/parameters/ID' }, { $ref: '#/components/parameters/RevisionID' }]
+    get:
+      operationId: listDraftPackageFiles
+      parameters: [{ name: name, in: query, schema: { type: string }, description: Return UTF-8 text for this file as well as the file list }]
+      responses:
+        '200':
+          description: Draft package file paths and optional contents
+          content:
+            application/json:
+              schema: { type: object, required: [files], properties: { files: { type: array, items: { type: string } }, text: { type: string } } }
+    patch:
+      operationId: editDraftPackageFile
+      security: [{ SessionCookie: [], CSRF: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - { type: object, required: [name, text], properties: { name: { type: string }, text: { type: string, description: UTF-8 text up to 256 KiB }, remove: { const: false } } }
+                - { type: object, required: [name, remove], properties: { name: { type: string }, remove: { const: true } } }
+      responses: { '204': { description: Changed the draft package } }
+  /submissions/{id}/source:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    get:
+      operationId: readSubmissionSource
+      responses:
+        '200':
+          description: Original source bytes, available to the owner or contest manager only
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '403': { $ref: '#/components/responses/Error' }
+  /contests/{id}/materials/{materialId}/attachment:
+    parameters: [{ $ref: '#/components/parameters/ID' }, { name: materialId, in: path, required: true, schema: { type: string, format: uuid } }]
+    get:
+      operationId: downloadPinnedMaterialAttachment
+      responses:
+        '200':
+          description: Download from the pinned revision if visible to the caller
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+  /health/live:
+    get:
+      security: []
+      operationId: liveness
+      responses: { '200': { description: Live } }
+  /courses/{id}/members:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    get:
+      operationId: listCourseRoles
+      responses: { '200': { description: Course roles visible to managers } }
+  /courses/{id}/members/{userId}/{role}:
+    parameters: [{ $ref: '#/components/parameters/ID' }, { $ref: '#/components/parameters/UserID' }, { name: role, in: path, required: true, schema: { enum: [manager, teacher, student, viewer] } }]
+    put:
+      operationId: grantCourseRole
+      security: [{ SessionCookie: [], CSRF: [] }]
+      responses: { '204': { description: Role granted } }
+    delete:
+      operationId: removeCourseRole
+      security: [{ SessionCookie: [], CSRF: [] }]
+      responses: { '204': { description: Role removed } }
+  /contests/{id}/members:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    get:
+      operationId: listContestRoles
+      responses: { '200': { description: Contest roles visible to managers } }
+  /contests/{id}/members/{userId}/{role}:
+    parameters: [{ $ref: '#/components/parameters/ID' }, { $ref: '#/components/parameters/UserID' }, { name: role, in: path, required: true, schema: { enum: [manager, viewer] } }]
+    put:
+      operationId: grantContestRole
+      security: [{ SessionCookie: [], CSRF: [] }]
+      responses: { '204': { description: Role granted } }
+    delete:
+      operationId: removeContestRole
+      security: [{ SessionCookie: [], CSRF: [] }]
+      responses: { '204': { description: Role removed } }
+  /contests/{id}/problems/{problemId}/revisions:
+    parameters: [{ $ref: '#/components/parameters/ID' }, { $ref: '#/components/parameters/ProblemID' }]
+    get:
+      operationId: listContestProblemRevisions
+      responses: { '200': { description: Published choices for a contest manager } }
+  /contests/{id}/problems/{problemId}/submissions/me:
+    parameters: [{ $ref: '#/components/parameters/ID' }, { $ref: '#/components/parameters/ProblemID' }]
+    get:
+      operationId: listMyTaskSubmissions
+      responses: { '200': { description: Own task submissions } }
+  /contests/{id}/score-publications:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    get:
+      operationId: listScorePublications
+      responses: { '200': { description: Manager-visible score publication history } }
+  /contests/{id}/grader-runs:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    get:
+      operationId: listGraderRuns
+      responses: { '200': { description: Manager-visible Grader runs } }
+  /materials/{id}:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    get:
+      operationId: getMaterial
+      responses: { '200': { description: Authorized material metadata } }
+  /problems/{id}:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    get:
+      operationId: getProblem
+      responses: { '200': { description: Authorized problem metadata } }
+    patch:
+      operationId: updateProblem
+      security: [{ SessionCookie: [], CSRF: [] }]
+      requestBody: { $ref: '#/components/requestBodies/TitleInput' }
+      responses: { '200': { description: Updated problem } }
+    delete:
+      operationId: archiveProblem
+      security: [{ SessionCookie: [], CSRF: [] }]
+      responses: { '204': { description: Archived } }
+  /problems/{id}/revisions/{revisionId}/languages/{code}:
+    parameters: [{ $ref: '#/components/parameters/ID' }, { $ref: '#/components/parameters/RevisionID' }, { name: code, in: path, required: true, schema: { type: string } }]
+    put:
+      operationId: enableRevisionLanguage
+      security: [{ SessionCookie: [], CSRF: [] }]
+      responses: { '204': { description: Enabled on draft revision } }
+    delete:
+      operationId: removeRevisionLanguage
+      security: [{ SessionCookie: [], CSRF: [] }]
+      responses: { '204': { description: Removed from draft revision } }
   /health/ready:
     get:
       security: []
@@ -173,14 +301,43 @@ paths:
     parameters: [{ $ref: '#/components/parameters/ID' }, { name: problemId, in: path, required: true, schema: { type: string, format: uuid } }]
     get:
       operationId: getContestProblem
-      responses: { '200': { description: Participant-safe task and allowed statement data } }
+      responses:
+        '200':
+          description: Participant-safe task and allowed statement data
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, title, problem_revision_id, execution_available, can_manage_submissions, statements, languages]
+                properties:
+                  id: { type: string, format: uuid }
+                  title: { type: string }
+                  problem_revision_id: { type: string, format: uuid }
+                  execution_available: { type: boolean, description: Whether the pinned revision is supported by the current judging pipeline }
+                  can_manage_submissions: { type: boolean }
+                  statements:
+                    type: array
+                    items: { type: object }
+                  languages:
+                    type: array
+                    items: { type: object }
     patch:
       operationId: switchContestProblemRevision
       security: [{ SessionCookie: [], CSRF: [] }]
       requestBody:
         content:
           application/json:
-            schema: { type: object, required: [problem_revision_id], properties: { problem_revision_id: { type: string, format: uuid } } }
+            schema:
+              type: object
+              required: [problem_revision_id]
+              properties:
+                problem_revision_id: { type: string, format: uuid }
+                settings:
+                  type: object
+                  required: [verdict_visibility]
+                  properties:
+                    submission_limit: { type: [integer, 'null'], minimum: 1 }
+                    verdict_visibility: { enum: [hidden, summary, tests] }
       responses: { '204': { description: Revision switched explicitly } }
     delete:
       operationId: detachContestProblem
@@ -237,7 +394,7 @@ paths:
     parameters: [{ $ref: '#/components/parameters/ID' }, { name: revisionId, in: path, required: true, schema: { type: string, format: uuid } }]
     put:
       operationId: uploadScriptedPackage
-      description: Upload a ZIP up to 16 MiB with a non-empty runner.lua at its root.
+      description: Upload a ZIP up to 16 MiB with Standard files or a non-empty root runner.lua for Lua. Grader-enabled drafts may include a root grader.py.
       security: [{ SessionCookie: [], CSRF: [] }]
       requestBody:
         content:
@@ -286,6 +443,9 @@ paths:
       responses: { '200': { description: Sanitized HTML and renderer digest } }
   /materials/{id}/revisions:
     parameters: [{ $ref: '#/components/parameters/ID' }]
+    get:
+      operationId: listMaterialRevisions
+      responses: { '200': { description: Material history; source only for editors } }
     post:
       operationId: createMaterialRevision
       security: [{ SessionCookie: [], CSRF: [] }]
@@ -293,9 +453,26 @@ paths:
         content:
           application/json:
             schema: { type: object, required: [format, source], properties: { format: { enum: [markdown, latex] }, source: { type: string, maxLength: 65536 } } }
+          multipart/form-data:
+            schema: { type: object, required: [format, source, file], properties: { format: { enum: [markdown, latex] }, source: { type: string, maxLength: 65536 }, file: { type: string, format: binary, description: Up to 8 MiB } } }
       responses: { '201': { description: Independent immutable material revision } }
   /contests/{id}/problems/{problemId}/submissions:
     parameters: [{ $ref: '#/components/parameters/ID' }, { name: problemId, in: path, required: true, schema: { type: string, format: uuid } }]
+    get:
+      operationId: listTaskSubmissions
+      parameters: [{ $ref: '#/components/parameters/After' }]
+      responses:
+        '200':
+          description: Page of up to 100 task submissions, visible to contest managers
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Submission' } }
+                  next: { type: string, description: Cursor for the next page; empty at the end }
+        '403': { $ref: '#/components/responses/Error' }
     post:
       operationId: submitSource
       security: [{ SessionCookie: [], CSRF: [] }]
@@ -306,7 +483,11 @@ paths:
             schema: { type: object, required: [source, language], properties: { source: { type: string, format: binary }, language: { type: string } } }
       responses:
         '202': { description: Submission, attempt, queue entry, and outbox committed transactionally }
-        '409': { $ref: '#/components/responses/Error' }
+        '409':
+          description: Submission limit reached or pinned revision unavailable for execution (`execution_unavailable`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /submissions:
     get:
       operationId: listMySubmissions
@@ -315,18 +496,88 @@ paths:
     parameters: [{ $ref: '#/components/parameters/ID' }]
     get:
       operationId: getSubmission
-      responses: { '200': { description: Participant-safe result and attempts } }
+      responses:
+        '200':
+          description: Submission and attempts filtered by verdict policy and manager rights
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [submission, attempts]
+                properties:
+                  submission: { $ref: '#/components/schemas/Submission' }
+                  attempts: { type: array, items: { $ref: '#/components/schemas/JudgingAttempt' } }
   /submissions/{id}/attempts:
     parameters: [{ $ref: '#/components/parameters/ID' }]
     get:
       operationId: listJudgingAttempts
-      responses: { '200': { description: Verdict-filtered immutable attempts } }
+      responses:
+        '200':
+          description: Attempts filtered by verdict policy and manager rights
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/JudgingAttempt' } }
+  /submissions/{id}/attempts/{attemptId}/cancel:
+    parameters: [{ $ref: '#/components/parameters/ID' }, { name: attemptId, in: path, required: true, schema: { type: string, format: uuid } }]
+    post:
+      operationId: cancelJudgingAttempt
+      security: [{ SessionCookie: [], CSRF: [] }]
+      responses:
+        '202':
+          description: Cancellation requested for an active attempt
+          content:
+            application/json:
+              schema: { type: object, required: [cancel_pending], properties: { cancel_pending: { const: true } } }
+        '204': { description: Attempt cancelled before claim or already cancelled }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409':
+          description: Cancellation is unavailable in the current state (`cancel_unavailable`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /submissions/{id}/events:
+    parameters: [{ $ref: '#/components/parameters/ID' }]
+    get:
+      operationId: streamSubmissionAttempts
+      responses:
+        '200':
+          description: Each `submission` event contains a JSON array of `JudgingAttempt` snapshots with the same field visibility as the attempts endpoint.
+          content:
+            text/event-stream:
+              schema: { type: string }
+  /submissions/{id}/artifacts/{artifactId}:
+    parameters: [{ $ref: '#/components/parameters/ID' }, { name: artifactId, in: path, required: true, schema: { type: string, format: uuid } }]
+    get:
+      operationId: downloadSubmissionArtifact
+      responses:
+        '200':
+          description: Owners and managers can download source. Diagnostic artifacts are available to contest managers.
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '403': { $ref: '#/components/responses/Error' }
   /submissions/{id}/rejudge:
     parameters: [{ $ref: '#/components/parameters/ID' }]
     post:
       operationId: rejudgeSubmission
       security: [{ SessionCookie: [], CSRF: [] }]
-      responses: { '202': { description: New attempt created; previous attempts retained } }
+      description: Rejudge on the current contest problem pin. An optional revision ID checks the pin has not changed.
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { problem_revision_id: { type: string, format: uuid } } }
+      responses:
+        '202': { description: New attempt created; previous attempts retained }
+        '409':
+          description: Target revision unavailable for execution or the expected pin changed (`execution_unavailable`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /contests/{id}/scoreboard:
     parameters: [{ $ref: '#/components/parameters/ID' }]
     get:
@@ -364,6 +615,9 @@ components:
     CSRF: { type: apiKey, in: header, name: X-CSRF-Token }
   parameters:
     ID: { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    UserID: { name: userId, in: path, required: true, schema: { type: string, format: uuid } }
+    ProblemID: { name: problemId, in: path, required: true, schema: { type: string, format: uuid } }
+    RevisionID: { name: revisionId, in: path, required: true, schema: { type: string, format: uuid } }
     After: { name: after, in: query, schema: { type: string, format: uuid } }
   requestBodies:
     TitleInput:
@@ -383,6 +637,66 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/ContestSettings' }
   schemas:
+    Submission:
+      type: object
+      required: [id, contest_id, contest_problem_id, problem_revision_id, submitted_at, language]
+      properties:
+        id: { type: string, format: uuid }
+        contest_id: { type: string, format: uuid }
+        contest_problem_id: { type: string, format: uuid }
+        problem_revision_id: { type: string, format: uuid }
+        submitted_at: { type: string, format: date-time }
+        language: { type: string }
+    JudgingAttempt:
+      type: object
+      required: [id, attempt_number, status, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        attempt_number: { type: integer, minimum: 1 }
+        status: { enum: [waiting, queued, assigned, running, recovery, finished, error, timeout, cancelled] }
+        created_at: { type: string, format: date-time }
+        verdict: { type: string }
+        base_score: { type: string }
+        phase: { enum: [building, running, testing], description: Present when progress is available to the caller }
+        active_tests: { type: array, items: { type: string }, description: Managers only }
+        tests:
+          type: array
+          description: Available under tests visibility or to contest managers
+          items:
+            type: object
+            required: [test_id, verdict]
+            properties:
+              test_id: { type: string }
+              verdict: { type: string }
+              score: { type: string, description: Managers only }
+              checker_metadata: { type: object, description: Managers only }
+        protocol:
+          type: object
+          description: Managers only
+          required: [problem_revision_id, groups]
+          properties:
+            problem_revision_id: { type: string, format: uuid }
+            started_at: { type: string, format: date-time }
+            finished_at: { type: string, format: date-time }
+            groups:
+              type: [array, 'null']
+              items:
+                type: object
+                required: [subgroup_id, score]
+                properties:
+                  subgroup_id: { type: string }
+                  score: { type: string }
+        artifacts:
+          type: array
+          description: Diagnostic artifact references for contest managers
+          items:
+            type: object
+            required: [id, kind]
+            properties:
+              id: { type: string, format: uuid }
+              kind: { type: string }
+        can_cancel: { type: boolean, description: Present and true when a contest manager can request cancellation }
+        cancel_pending: { type: boolean, description: Present and true while cancellation is pending on an active attempt }
     Error:
       type: object
       required: [error]

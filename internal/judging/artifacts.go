@@ -102,7 +102,7 @@ func (s *ArtifactControl) inputs(ctx context.Context, req *pb.RunLease, claim bo
 	var out pb.ClaimResponse
 	err := db.Tx(ctx, s.Pool, func(tx pgx.Tx) error {
 		if claim {
-			if err := reserveQueuedStandard(ctx, tx, req); err != nil {
+			if err := reserveQueued(ctx, tx, req); err != nil {
 				return err
 			}
 		}

@@ -11,10 +11,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nats-io/nats.go"
 	"podtest/internal/db"
+	"podtest/internal/problem"
 )
 
 const (
 	Subject     = "podtest.judging.jobs.v1"
+	luaSubject  = "podtest.judging.lua.v1"
 	jobStream   = "PODTEST_JUDGING"
 	jobConsumer = "podtest-standard"
 )
@@ -24,7 +26,7 @@ func RunWorker(ctx context.Context, pool *pgxpool.Pool, url string) error {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 		for {
-			if err := finishWithoutInvoker(ctx, pool); err != nil && ctx.Err() == nil {
+			if err := failUnassigned(ctx, pool, false, "No execution Invoker is configured"); err != nil && ctx.Err() == nil {
 				slog.Error("no-invoker judging", "error", err)
 			}
 			select {
@@ -58,6 +60,9 @@ func RunWorker(ctx context.Context, pool *pgxpool.Pool, url string) error {
 		if err := retryExpiredStandard(ctx, pool); err != nil && ctx.Err() == nil {
 			slog.Error("expired Standard attempt retry", "error", err)
 		}
+		if err := failUnassigned(ctx, pool, true, "Task revision is not available for execution"); err != nil && ctx.Err() == nil {
+			slog.Error("unavailable judging revision", "error", err)
+		}
 		if err := dispatch(ctx, pool, js); err != nil && ctx.Err() == nil {
 			slog.Error("judging outbox", "error", err)
 		}
@@ -72,23 +77,39 @@ func RunWorker(ctx context.Context, pool *pgxpool.Pool, url string) error {
 func provisionStandardQueue(ctx context.Context, js nats.JetStreamContext) error {
 	stream, err := js.StreamInfo(jobStream, nats.Context(ctx))
 	if errors.Is(err, nats.ErrStreamNotFound) {
-		stream, err = js.AddStream(&nats.StreamConfig{Name: jobStream, Subjects: []string{Subject}, Retention: nats.WorkQueuePolicy, Storage: nats.FileStorage, Duplicates: 10 * time.Minute, Discard: nats.DiscardNew}, nats.Context(ctx))
+		stream, err = js.AddStream(&nats.StreamConfig{Name: jobStream, Subjects: []string{Subject, luaSubject}, Retention: nats.WorkQueuePolicy, Storage: nats.FileStorage, Duplicates: 10 * time.Minute, Discard: nats.DiscardNew}, nats.Context(ctx))
 	}
 	if err != nil {
 		return err
 	}
-	if stream.Config.Retention != nats.WorkQueuePolicy || stream.Config.Storage != nats.FileStorage || len(stream.Config.Subjects) != 1 || stream.Config.Subjects[0] != Subject {
+	if stream.Config.Retention != nats.WorkQueuePolicy || stream.Config.Storage != nats.FileStorage {
 		return errors.New("incompatible judging stream configuration")
 	}
-	consumer, err := js.ConsumerInfo(jobStream, jobConsumer, nats.Context(ctx))
+	subjects := stream.Config.Subjects
+	if len(subjects) == 1 && subjects[0] == Subject {
+		stream.Config.Subjects = []string{Subject, luaSubject}
+		if _, err = js.UpdateStream(&stream.Config, nats.Context(ctx)); err != nil {
+			return err
+		}
+	} else if len(subjects) != 2 || !((subjects[0] == Subject && subjects[1] == luaSubject) || (subjects[1] == Subject && subjects[0] == luaSubject)) {
+		return errors.New("incompatible judging stream subjects")
+	}
+	if err = provisionConsumer(ctx, js, jobConsumer, Subject); err != nil {
+		return err
+	}
+	return provisionConsumer(ctx, js, "podtest-scripted-lua", luaSubject)
+}
+
+func provisionConsumer(ctx context.Context, js nats.JetStreamContext, name, subject string) error {
+	consumer, err := js.ConsumerInfo(jobStream, name, nats.Context(ctx))
 	if errors.Is(err, nats.ErrConsumerNotFound) {
-		consumer, err = js.AddConsumer(jobStream, &nats.ConsumerConfig{Durable: jobConsumer, FilterSubject: Subject, AckPolicy: nats.AckExplicitPolicy, AckWait: 30 * time.Second}, nats.Context(ctx))
+		consumer, err = js.AddConsumer(jobStream, &nats.ConsumerConfig{Durable: name, FilterSubject: subject, AckPolicy: nats.AckExplicitPolicy, AckWait: 30 * time.Second}, nats.Context(ctx))
 	}
 	if err != nil {
 		return err
 	}
 	cfg := consumer.Config
-	if cfg.Durable != jobConsumer || cfg.AckPolicy != nats.AckExplicitPolicy || cfg.DeliverSubject != "" || cfg.HeadersOnly || cfg.FilterSubject != Subject || len(cfg.FilterSubjects) != 0 {
+	if cfg.Durable != name || cfg.AckPolicy != nats.AckExplicitPolicy || cfg.DeliverSubject != "" || cfg.HeadersOnly || cfg.FilterSubject != subject || len(cfg.FilterSubjects) != 0 {
 		return errors.New("incompatible judging consumer configuration")
 	}
 	return nil
@@ -109,7 +130,16 @@ func recoverExpired(ctx context.Context, pool *pgxpool.Pool) error {
 			return err
 		}
 		for _, id := range ids {
-			if _, err := tx.Exec(ctx, `UPDATE judging_attempts SET status='recovery' WHERE id=$1`, id); err != nil {
+			if _, err := tx.Exec(ctx, `WITH expired AS (
+				UPDATE judging_attempts SET
+					status=CASE WHEN cancel_requested_at IS NULL THEN 'recovery' ELSE 'cancelled' END,
+					finished_at=CASE WHEN cancel_requested_at IS NOT NULL THEN clock_timestamp() ELSE finished_at END,
+					last_sequence=last_sequence+CASE WHEN cancel_requested_at IS NOT NULL THEN 1 ELSE 0 END
+				WHERE id=$1 RETURNING id,run_id,last_sequence,status)
+				INSERT INTO judging_events(event_id,attempt_id,run_id,sequence,schema_version,kind,payload,occurred_at)
+				SELECT gen_random_uuid(),id,run_id,last_sequence,1,'attempt_finished',
+					'{"status":"cancelled","outcome":"lease_expired"}',clock_timestamp()
+				FROM expired WHERE status='cancelled'`, id); err != nil {
 				return err
 			}
 			if _, err := tx.Exec(ctx, `UPDATE queue_entries SET status='done' WHERE attempt_id=$1 AND status='assigned'`, id); err != nil {
@@ -131,8 +161,7 @@ func retryExpiredStandard(ctx context.Context, pool *pgxpool.Pool) error {
 			JOIN contests c ON c.id=s.contest_id JOIN contest_settings cs ON cs.contest_id=c.id
 			JOIN problem_revisions r ON r.id=j.target_problem_revision_id
 			WHERE j.status='recovery' AND j.trigger_reason<>'lease_recovery' AND c.archived_at IS NULL
-			AND r.status='published' AND r.execution_format='standard' AND r.format_version=1
-			AND r.manifest->>'package_format'='ustar_v1' AND r.manifest->'execution_ready'='true'::jsonb
+			AND `+problem.RunnableRevisionSQL+`
 			AND NOT EXISTS (SELECT FROM judging_attempts newer WHERE newer.submission_id=s.id AND newer.attempt_number>j.attempt_number)
 			ORDER BY j.lease_until,j.id LIMIT 1 FOR UPDATE OF c SKIP LOCKED`).Scan(&contest, &id, &participant, &revision, &score, &cap)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -153,11 +182,15 @@ func retryExpiredStandard(ctx context.Context, pool *pgxpool.Pool) error {
 	})
 }
 
-func finishWithoutInvoker(ctx context.Context, pool *pgxpool.Pool) error {
+func failUnassigned(ctx context.Context, pool *pgxpool.Pool, onlyUnavailable bool, message string) error {
 	return db.Tx(ctx, pool, func(tx pgx.Tx) error {
 		var id string
-		query := `SELECT j.id FROM judging_attempts j JOIN queue_entries q ON q.attempt_id=j.id WHERE j.status IN ('waiting','queued') AND q.status IN ('waiting','queued') ORDER BY j.created_at,j.id LIMIT 1 FOR UPDATE OF j,q SKIP LOCKED`
-		err := tx.QueryRow(ctx, query).Scan(&id)
+		query := `SELECT j.id FROM judging_attempts j JOIN queue_entries q ON q.attempt_id=j.id
+			JOIN problem_revisions r ON r.id=j.target_problem_revision_id
+			WHERE j.status IN ('waiting','queued') AND q.status IN ('waiting','queued')
+			AND (NOT $1::boolean OR NOT ` + problem.RunnableRevisionSQL + `)
+			ORDER BY j.created_at,j.id LIMIT 1 FOR UPDATE OF j,q SKIP LOCKED`
+		err := tx.QueryRow(ctx, query, onlyUnavailable).Scan(&id)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}
@@ -170,7 +203,6 @@ func finishWithoutInvoker(ctx context.Context, pool *pgxpool.Pool) error {
 		if _, err = tx.Exec(ctx, `UPDATE queue_entries SET status='done' WHERE attempt_id=$1`, id); err != nil {
 			return err
 		}
-		const message = "No execution Invoker is configured"
 		_, err = tx.Exec(ctx, `INSERT INTO judging_events(event_id,attempt_id,run_id,sequence,schema_version,kind,payload,occurred_at) SELECT gen_random_uuid(),id,run_id,last_sequence,1,'attempt_finished',jsonb_build_object('status','error','verdict','testing_error','message',$2::text),now() FROM judging_attempts WHERE id=$1`, id, message)
 		return err
 	})
@@ -196,9 +228,8 @@ func dispatch(ctx context.Context, pool *pgxpool.Pool, js nats.JetStreamContext)
 		var id, topic, dedup string
 		var data []byte
 		err = tx.QueryRow(ctx, `SELECT e.id,e.topic,e.dedup_key,e.payload FROM outbox_events e JOIN queue_entries q ON q.attempt_id::text=e.dedup_key JOIN judging_attempts j ON j.id=q.attempt_id JOIN problem_revisions r ON r.id=j.target_problem_revision_id
-			WHERE e.published_at IS NULL AND e.topic=$1 AND q.status='queued' AND j.status='queued' AND r.status='published'
-			AND r.execution_format='standard' AND r.format_version=1 AND r.manifest->>'package_format'='ustar_v1' AND r.manifest->'execution_ready'='true'::jsonb
-			ORDER BY e.created_at,e.id LIMIT 1 FOR UPDATE OF e SKIP LOCKED`, Subject).Scan(&id, &topic, &dedup, &data)
+			WHERE e.published_at IS NULL AND e.topic IN ($1,$2) AND q.status='queued' AND j.status='queued' AND `+problem.RunnableRevisionSQL+`
+			ORDER BY e.created_at,e.id LIMIT 1 FOR UPDATE OF e SKIP LOCKED`, Subject, luaSubject).Scan(&id, &topic, &dedup, &data)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}

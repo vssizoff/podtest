@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -20,10 +22,10 @@ import (
 )
 
 func (a *api) revisionManager() problems.Manager {
-	return problems.Manager{Pool: a.pool, Artifacts: a.artifacts, Renderer: a.renderer}
+	return problems.Manager{Pool: a.pool, Artifacts: a.artifacts, Renderer: a.renderer, EnableLua: os.Getenv("JUDGING_ENABLE_LUA") == "true"}
 }
 func (a *api) materialManager() material.Manager {
-	return material.Manager{Pool: a.pool, Renderer: a.renderer}
+	return material.Manager{Pool: a.pool, Renderer: a.renderer, Artifacts: a.artifacts, Auth: a.catalog.Auth}
 }
 func (a *api) submissionManager() judging.Submissions { return *a.submissions }
 func (a *api) graderManager() grader.Manager          { return grader.Manager{Pool: a.pool} }
@@ -157,7 +159,11 @@ func (a *api) setLanguage(w http.ResponseWriter, r *http.Request) {
 		a.failure(w, r, err)
 		return
 	}
-	if err := a.revisionManager().SetLanguage(r.Context(), chi.URLParam(r, "id"), chi.URLParam(r, "revisionId"), chi.URLParam(r, "code")); err != nil {
+	change := a.revisionManager().SetLanguage
+	if r.Method == http.MethodDelete {
+		change = a.revisionManager().RemoveLanguage
+	}
+	if err := change(r.Context(), chi.URLParam(r, "id"), chi.URLParam(r, "revisionId"), chi.URLParam(r, "code")); err != nil {
 		a.failure(w, r, err)
 		return
 	}
@@ -198,6 +204,43 @@ func (a *api) setPackage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(204)
+}
+
+func (a *api) draftPackageFiles(w http.ResponseWriter, r *http.Request) {
+	names, text, err := a.revisionManager().DraftPackage(r.Context(), chi.URLParam(r, "id"), chi.URLParam(r, "revisionId"), r.URL.Query().Get("name"))
+	if err != nil {
+		a.failure(w, r, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "private, no-store")
+	json(w, 200, struct {
+		Files []string `json:"files"`
+		Text  *string  `json:"text,omitempty"`
+	}{names, text})
+}
+
+func (a *api) editPackageFile(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name   string  `json:"name"`
+		Text   *string `json:"text"`
+		Remove bool    `json:"remove"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	if in.Remove == (in.Text != nil) || (in.Text != nil && len(*in.Text) > problems.MaxPackageText) {
+		a.failure(w, r, problems.ErrInvalid)
+		return
+	}
+	var data []byte
+	if in.Text != nil {
+		data = []byte(*in.Text)
+	}
+	if err := a.revisionManager().EditPackageFile(r.Context(), a.principalID(r), chi.URLParam(r, "id"), chi.URLParam(r, "revisionId"), in.Name, data, in.Remove); err != nil {
+		a.failure(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 func (a *api) validateRevision(w http.ResponseWriter, r *http.Request) {
 	if err := a.catalog.Require(r.Context(), a.principalID(r), "can_edit", "problem", chi.URLParam(r, "id")); err != nil {
@@ -264,18 +307,33 @@ func (a *api) detachProblem(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(204)
 }
+func (a *api) pinnedProblemRevisions(w http.ResponseWriter, r *http.Request) {
+	contest, cp := chi.URLParam(r, "id"), chi.URLParam(r, "problemId")
+	if err := a.catalog.Require(r.Context(), a.principalID(r), "can_manage", "contest", contest); err != nil {
+		a.failure(w, r, err)
+		return
+	}
+	items, err := a.revisionManager().PinnedRevisions(r.Context(), contest, cp)
+	if err != nil {
+		a.failure(w, r, err)
+		return
+	}
+	json(w, 200, map[string]any{"items": items})
+}
+
 func (a *api) switchProblemRevision(w http.ResponseWriter, r *http.Request) {
 	if err := a.catalog.Require(r.Context(), a.principalID(r), "can_manage", "contest", chi.URLParam(r, "id")); err != nil {
 		a.failure(w, r, err)
 		return
 	}
 	var in struct {
-		RevisionID string `json:"problem_revision_id"`
+		RevisionID string                           `json:"problem_revision_id"`
+		Settings   *problems.ContestProblemSettings `json:"settings"`
 	}
 	if !decode(w, r, &in) {
 		return
 	}
-	if err := a.revisionManager().Switch(r.Context(), a.principalID(r), chi.URLParam(r, "id"), chi.URLParam(r, "problemId"), in.RevisionID); err != nil {
+	if err := a.revisionManager().Configure(r.Context(), a.principalID(r), chi.URLParam(r, "id"), chi.URLParam(r, "problemId"), in.RevisionID, in.Settings); err != nil {
 		a.failure(w, r, err)
 		return
 	}
@@ -292,7 +350,15 @@ func (a *api) task(w http.ResponseWriter, r *http.Request) {
 		a.failure(w, r, err)
 		return
 	}
-	json(w, 200, item)
+	manager, err := a.catalog.Allowed(r.Context(), a.principalID(r), "can_manage", "contest", contest)
+	if err != nil {
+		a.failure(w, r, err)
+		return
+	}
+	json(w, 200, struct {
+		problems.Task
+		CanManageSubmissions bool `json:"can_manage_submissions"`
+	}{item, manager})
 }
 
 func (a *api) createMaterial(w http.ResponseWriter, r *http.Request) {
@@ -318,19 +384,85 @@ func (a *api) getMaterial(w http.ResponseWriter, r *http.Request) {
 }
 func (a *api) createMaterialRevision(w http.ResponseWriter, r *http.Request) {
 	var in material.RevisionInput
-	if !decode(w, r, &in) {
-		return
-	}
 	if err := a.catalog.Require(r.Context(), a.principalID(r), "can_edit", "material", chi.URLParam(r, "id")); err != nil {
 		a.failure(w, r, err)
 		return
 	}
-	item, err := a.materialManager().CreateRevision(r.Context(), chi.URLParam(r, "id"), in)
+	var name string
+	var data []byte
+	if media, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); media == "multipart/form-data" {
+		r.Body = http.MaxBytesReader(w, r.Body, 9<<20)
+		if err := r.ParseMultipartForm(256 << 10); err != nil {
+			problemErr(w, r, 400, "invalid_upload", "invalid material upload")
+			return
+		}
+		defer r.MultipartForm.RemoveAll()
+		in.Format, in.Source = r.FormValue("format"), r.FormValue("source")
+		f, header, err := r.FormFile("file")
+		if err != nil {
+			problemErr(w, r, 422, "invalid_upload", "file field is required")
+			return
+		}
+		defer f.Close()
+		name = header.Filename
+		data, err = io.ReadAll(io.LimitReader(f, (8<<20)+1))
+		if err != nil || len(data) == 0 || len(data) > 8<<20 {
+			problemErr(w, r, 422, "invalid_upload", "file must be between 1 byte and 8 MiB")
+			return
+		}
+	} else if !decode(w, r, &in) {
+		return
+	}
+	item, err := a.materialManager().CreateRevision(r.Context(), a.principalID(r), chi.URLParam(r, "id"), in, name, data)
 	if err != nil {
 		a.failure(w, r, err)
 		return
 	}
 	json(w, 201, item)
+}
+
+func (a *api) materialAttachment(w http.ResponseWriter, r *http.Request) {
+	ctx, user, contest := r.Context(), a.principalID(r), chi.URLParam(r, "id")
+	if err := a.catalog.Require(ctx, user, "can_view", "contest", contest); err != nil {
+		a.failure(w, r, err)
+		return
+	}
+	manager, err := a.catalog.Allowed(ctx, user, "can_manage", "contest", contest)
+	if err != nil {
+		a.failure(w, r, err)
+		return
+	}
+	var id, name string
+	err = a.pool.QueryRow(ctx, `SELECT r.attachment_id,r.attachment_name FROM contest_materials cm JOIN material_revisions r ON r.id=cm.material_revision_id
+		WHERE cm.contest_id=$1 AND cm.material_id=$2 AND r.attachment_id IS NOT NULL AND (cm.visibility='contest' OR $3)`, contest, chi.URLParam(r, "materialId"), manager).Scan(&id, &name)
+	if err != nil {
+		a.failure(w, r, err)
+		return
+	}
+	reader, err := a.artifacts.Open(ctx, id)
+	if err != nil {
+		a.failure(w, r, err)
+		return
+	}
+	defer reader.Close()
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": name}))
+	_, _ = io.Copy(w, reader)
+}
+func (a *api) materialHistory(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	edit, err := a.catalog.Allowed(r.Context(), a.principalID(r), "can_edit", "material", id)
+	if err != nil {
+		a.failure(w, r, err)
+		return
+	}
+	items, err := a.materialManager().History(r.Context(), id, edit)
+	if err != nil {
+		a.failure(w, r, err)
+		return
+	}
+	json(w, 200, map[string]any{"items": items})
 }
 func (a *api) renderPreview(w http.ResponseWriter, r *http.Request) {
 	var in material.RevisionInput
@@ -435,6 +567,27 @@ func (a *api) mySubmissions(w http.ResponseWriter, r *http.Request) {
 	}
 	json(w, 200, map[string]any{"items": items})
 }
+func (a *api) taskSubmissions(w http.ResponseWriter, r *http.Request) {
+	contest, cp := chi.URLParam(r, "id"), chi.URLParam(r, "problemId")
+	if !a.requireObject(w, r, "can_manage", "contest", contest) {
+		return
+	}
+	if !uuidRE.MatchString(cp) {
+		problemErr(w, r, 422, "invalid_id", "expected a UUID")
+		return
+	}
+	after := r.URL.Query().Get("after")
+	if after != "" && !uuidRE.MatchString(after) {
+		problemErr(w, r, 422, "invalid_id", "expected a UUID cursor")
+		return
+	}
+	items, next, err := a.submissionManager().ListTask(r.Context(), contest, cp, after)
+	if err != nil {
+		a.failure(w, r, err)
+		return
+	}
+	json(w, 200, map[string]any{"items": items, "next": next})
+}
 func (a *api) mySubmissionsList(w http.ResponseWriter, r *http.Request) {
 	items, err := a.submissionManager().List(r.Context(), a.principalID(r), "", "")
 	if err != nil {
@@ -511,13 +664,53 @@ func (a *api) rejudge(w http.ResponseWriter, r *http.Request) {
 	if r.Body != nil && r.ContentLength != 0 && !decode(w, r, &in) {
 		return
 	}
-	attempt, err := a.submissionManager().Rejudge(r.Context(), a.principalID(r), sub.ID, in.RevisionID)
+	attempt, err := a.submissionManager().RejudgePinned(r.Context(), a.principalID(r), sub.ID, in.RevisionID)
 	if err != nil {
 		a.failure(w, r, err)
 		return
 	}
 	json(w, 202, map[string]string{"judging_attempt_id": attempt})
 }
+func (a *api) cancelAttempt(w http.ResponseWriter, r *http.Request) {
+	submission, attempt := chi.URLParam(r, "id"), chi.URLParam(r, "attemptId")
+	if !uuidRE.MatchString(submission) || !uuidRE.MatchString(attempt) {
+		problemErr(w, r, 422, "invalid_id", "expected UUIDs")
+		return
+	}
+	sub, _, manager, err := a.submissionAccess(r.Context(), a.principalID(r), submission)
+	if err != nil {
+		a.failure(w, r, err)
+		return
+	}
+	if !manager {
+		a.failure(w, r, catalog.ErrDenied)
+		return
+	}
+	pending, err := a.submissionManager().Cancel(r.Context(), a.principalID(r), sub.ID, attempt)
+	if err != nil {
+		a.failure(w, r, err)
+		return
+	}
+	if pending {
+		json(w, http.StatusAccepted, map[string]bool{"cancel_pending": true})
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+func (a *api) submissionSource(w http.ResponseWriter, r *http.Request) {
+	sub, _, _, err := a.submissionAccess(r.Context(), a.principalID(r), chi.URLParam(r, "id"))
+	if err != nil {
+		a.failure(w, r, err)
+		return
+	}
+	var artifact string
+	if err := a.pool.QueryRow(r.Context(), `SELECT source_artifact_id FROM submissions WHERE id=$1`, sub.ID).Scan(&artifact); err != nil {
+		a.failure(w, r, err)
+		return
+	}
+	a.downloadArtifact(w, r, artifact)
+}
+
 func (a *api) download(w http.ResponseWriter, r *http.Request) {
 	sub, _, manager, err := a.submissionAccess(r.Context(), a.principalID(r), chi.URLParam(r, "id"))
 	if err != nil {
@@ -531,6 +724,10 @@ func (a *api) download(w http.ResponseWriter, r *http.Request) {
 		a.failure(w, r, catalog.ErrDenied)
 		return
 	}
+	a.downloadArtifact(w, r, artifactID)
+}
+
+func (a *api) downloadArtifact(w http.ResponseWriter, r *http.Request, artifactID string) {
 	reader, err := a.artifacts.Open(r.Context(), artifactID)
 	if err != nil {
 		a.failure(w, r, err)
@@ -619,7 +816,17 @@ func (a *api) graderSnapshot(w http.ResponseWriter, r *http.Request) {
 		problemErr(w, r, 403, "invalid_capability", "run capability invalid or expired")
 		return
 	}
-	json(w, 200, map[string]any{"run": run, "scope": scope})
+	inputs, err := a.graderManager().SnapshotScores(r.Context(), run.ID, bearer(r))
+	if errors.Is(err, pgx.ErrNoRows) {
+		problemErr(w, r, 403, "invalid_capability", "run capability invalid or expired")
+		return
+	}
+	if err != nil {
+		a.failure(w, r, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "private, no-store")
+	json(w, 200, map[string]any{"run": run, "scope": scope, "results": inputs})
 }
 func (a *api) graderResult(w http.ResponseWriter, r *http.Request) {
 	run, _, err := a.graderManager().Snapshot(r.Context(), chi.URLParam(r, "id"), bearer(r))
@@ -648,7 +855,10 @@ func (a *api) graderRuns(w http.ResponseWriter, r *http.Request) {
 		a.failure(w, r, err)
 		return
 	}
-	items, err := pgx.CollectRows(rows, pgx.RowToStructByPos[grader.Run])
+	items, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (item grader.Run, err error) {
+		err = row.Scan(&item.ID, &item.ContestID, &item.ProblemID, &item.SnapshotID, &item.SnapshotDigest, &item.Mode, &item.Status)
+		return
+	})
 	if err != nil {
 		a.failure(w, r, err)
 		return
@@ -666,7 +876,28 @@ func (a *api) getGraderRun(w http.ResponseWriter, r *http.Request) {
 		a.failure(w, r, err)
 		return
 	}
-	json(w, 200, item)
+	var log string
+	var published bool
+	if err = a.pool.QueryRow(r.Context(), `SELECT log, EXISTS(SELECT FROM score_publications WHERE grader_run_id=$1) FROM grader_runs WHERE id=$1`, item.ID).Scan(&log, &published); err != nil {
+		a.failure(w, r, err)
+		return
+	}
+	rows, err := a.pool.Query(r.Context(), `SELECT p.participant_id,p.contest_problem_id,p.score::text,p.metadata FROM grader_scores p WHERE p.grader_run_id=$1 ORDER BY p.participant_id LIMIT 5000`, item.ID)
+	if err != nil {
+		a.failure(w, r, err)
+		return
+	}
+	scores, err := pgx.CollectRows(rows, pgx.RowToStructByPos[grader.Score])
+	if err != nil {
+		a.failure(w, r, err)
+		return
+	}
+	json(w, 200, struct {
+		grader.Run
+		Log       string         `json:"log"`
+		Published bool           `json:"published"`
+		Scores    []grader.Score `json:"scores"`
+	}{item, log, published, scores})
 }
 func (a *api) publishGrader(w http.ResponseWriter, r *http.Request) {
 	var contest string

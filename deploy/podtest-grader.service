@@ -1,0 +1,12 @@
+[Unit]
+Description=Podtest Grader worker
+
+[Service]
+EnvironmentFile=%h/.config/podtest/grader.env
+ExecStart=%h/.local/bin/backend grader-worker
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+
+[Install]
+WantedBy=default.target

@@ -18,7 +18,9 @@ import (
 	"podtest/internal/auth"
 	"podtest/internal/authorization"
 	"podtest/internal/catalog"
+	"podtest/internal/grader"
 	"podtest/internal/judging"
+	"podtest/internal/material"
 	problems "podtest/internal/problem"
 	"podtest/internal/statement"
 )
@@ -81,6 +83,9 @@ func Router(pool *pgxpool.Pool, sessions *auth.Sessions, authz *authorization.Ma
 			p.Get("/contests/{id}/participants", a.participants)
 			p.Post("/contests/{id}/participants", a.registerParticipant)
 			p.Delete("/contests/{id}/participants/{userId}", a.removeParticipant)
+			p.Get("/contests/{id}/members", a.listRoles("contest"))
+			p.Put("/contests/{id}/members/{userId}/{role}", a.role("contest", false))
+			p.Delete("/contests/{id}/members/{userId}/{role}", a.role("contest", true))
 			p.Get("/problems", a.list("problem"))
 			p.Post("/problems", a.create("problem"))
 			p.Get("/problems/{id}", a.get("problem"))
@@ -93,18 +98,24 @@ func Router(pool *pgxpool.Pool, sessions *auth.Sessions, authz *authorization.Ma
 			p.Get("/contests/{id}/problems", a.contestProblems)
 			p.Post("/contests/{id}/problems", a.attachProblem)
 			p.Patch("/contests/{id}/problems/{problemId}", a.switchProblemRevision)
+			p.Get("/contests/{id}/problems/{problemId}/revisions", a.pinnedProblemRevisions)
 			p.Get("/contests/{id}/materials", a.contestMaterials)
+			p.Get("/contests/{id}/materials/{materialId}/attachment", a.materialAttachment)
 			p.Post("/materials", a.createMaterial)
 			p.With(a.resource("material", "can_view")).Get("/materials/{id}", a.getMaterial)
+			p.With(a.resource("material", "can_view")).Get("/materials/{id}/revisions", a.materialHistory)
 			p.With(a.resource("material", "can_edit")).Post("/materials/{id}/revisions", a.createMaterialRevision)
 			p.Post("/materials/render", a.renderPreview)
 			p.Post("/contests/{id}/materials", a.attachMaterial)
 			p.Post("/contests/{id}/problems/{problemId}/submissions", a.submit)
+			p.Get("/contests/{id}/problems/{problemId}/submissions", a.taskSubmissions)
 			p.Get("/contests/{id}/problems/{problemId}/submissions/me", a.mySubmissions)
 			p.Get("/submissions", a.mySubmissionsList)
 			p.Get("/submissions/{id}", a.getSubmission)
 			p.Get("/submissions/{id}/attempts", a.attempts)
+			p.Get("/submissions/{id}/source", a.submissionSource)
 			p.Post("/submissions/{id}/rejudge", a.rejudge)
+			p.Post("/submissions/{id}/attempts/{attemptId}/cancel", a.cancelAttempt)
 			p.Get("/contests/{id}/scoreboard", a.scoreboard)
 			p.Get("/contests/{id}/scoreboard/me", a.scoreboardMe)
 			p.Get("/contests/{id}/score-publications", a.publications)
@@ -116,7 +127,10 @@ func Router(pool *pgxpool.Pool, sessions *auth.Sessions, authz *authorization.Ma
 			p.Delete("/contests/{id}/problems/{problemId}", a.detachProblem)
 			p.With(a.resource("problem", "can_edit")).Put("/problems/{id}/revisions/{revisionId}/statements/{locale}", a.setStatement)
 			p.With(a.resource("problem", "can_edit")).Put("/problems/{id}/revisions/{revisionId}/languages/{code}", a.setLanguage)
+			p.With(a.resource("problem", "can_edit")).Delete("/problems/{id}/revisions/{revisionId}/languages/{code}", a.setLanguage)
 			p.With(a.resource("problem", "can_edit")).Put("/problems/{id}/revisions/{revisionId}/package", a.setPackage)
+			p.With(a.resource("problem", "can_edit")).Get("/problems/{id}/revisions/{revisionId}/package/files", a.draftPackageFiles)
+			p.With(a.resource("problem", "can_edit")).Patch("/problems/{id}/revisions/{revisionId}/package/files", a.editPackageFile)
 			p.With(a.resource("problem", "can_edit")).Post("/problems/{id}/revisions/{revisionId}/validate", a.validateRevision)
 			p.With(a.resource("problem", "can_edit")).Post("/problems/{id}/revisions/{revisionId}/publish", a.publishRevision)
 			p.Get("/submissions/{id}/artifacts/{artifactId}", a.download)
@@ -415,9 +429,13 @@ func (a *api) failure(w http.ResponseWriter, r *http.Request, err error) {
 		problem(w, r, 409, "revision_not_draft", err.Error())
 	case errors.Is(err, judging.ErrLimit):
 		problem(w, r, 409, "submission_limit", err.Error())
+	case errors.Is(err, judging.ErrExecutionUnavailable):
+		problem(w, r, 409, "execution_unavailable", err.Error())
+	case errors.Is(err, judging.ErrCancelUnavailable):
+		problem(w, r, 409, "cancel_unavailable", err.Error())
 	case errors.Is(err, judging.ErrInvalid):
 		problem(w, r, 422, "submission_invalid", err.Error())
-	case errors.Is(err, catalog.ErrInvalid), errors.Is(err, catalog.ErrSettings), errors.Is(err, problems.ErrInvalid), errors.Is(err, problems.ErrArchive), errors.Is(err, problems.ErrMissingRunner), errors.Is(err, problems.ErrMissingPackage), errors.Is(err, problems.ErrIncomplete), errors.Is(err, problems.ErrReservedFile), errors.Is(err, problems.ErrUnsupported), errors.Is(err, statement.ErrInvalid):
+	case errors.Is(err, grader.ErrInvalid), errors.Is(err, material.ErrInvalid), errors.Is(err, catalog.ErrInvalid), errors.Is(err, catalog.ErrSettings), errors.Is(err, problems.ErrInvalid), errors.Is(err, problems.ErrArchive), errors.Is(err, problems.ErrMissingRunner), errors.Is(err, problems.ErrMissingPackage), errors.Is(err, problems.ErrIncomplete), errors.Is(err, problems.ErrReservedFile), errors.Is(err, problems.ErrUnsupported), errors.Is(err, statement.ErrInvalid):
 		problem(w, r, 422, "validation_error", err.Error())
 	case errors.Is(err, pgx.ErrNoRows):
 		problem(w, r, 404, "not_found", "resource not found")

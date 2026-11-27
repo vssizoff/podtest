@@ -670,6 +670,7 @@ func (x *RunLease) GetFencingToken() []byte {
 type RenewLeaseResponse struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
 	LeaseExpiresUnix int64                  `protobuf:"varint,1,opt,name=lease_expires_unix,json=leaseExpiresUnix,proto3" json:"lease_expires_unix,omitempty"`
+	CancelRequested  bool                   `protobuf:"varint,2,opt,name=cancel_requested,json=cancelRequested,proto3" json:"cancel_requested,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -709,6 +710,13 @@ func (x *RenewLeaseResponse) GetLeaseExpiresUnix() int64 {
 		return x.LeaseExpiresUnix
 	}
 	return 0
+}
+
+func (x *RenewLeaseResponse) GetCancelRequested() bool {
+	if x != nil {
+		return x.CancelRequested
+	}
+	return false
 }
 
 type CreateArtifactUploadRequest struct {
@@ -1039,9 +1047,10 @@ const file_podtest_invoker_v1_control_proto_rawDesc = "" +
 	"\n" +
 	"attempt_id\x18\x03 \x01(\tR\tattemptId\x12\x15\n" +
 	"\x06run_id\x18\x04 \x01(\tR\x05runId\x12#\n" +
-	"\rfencing_token\x18\x05 \x01(\fR\ffencingToken\"B\n" +
+	"\rfencing_token\x18\x05 \x01(\fR\ffencingToken\"m\n" +
 	"\x12RenewLeaseResponse\x12,\n" +
-	"\x12lease_expires_unix\x18\x01 \x01(\x03R\x10leaseExpiresUnix\"\xd7\x01\n" +
+	"\x12lease_expires_unix\x18\x01 \x01(\x03R\x10leaseExpiresUnix\x12)\n" +
+	"\x10cancel_requested\x18\x02 \x01(\bR\x0fcancelRequested\"\xd7\x01\n" +
 	"\x1bCreateArtifactUploadRequest\x122\n" +
 	"\x05lease\x18\x01 \x01(\v2\x1c.podtest.invoker.v1.RunLeaseR\x05lease\x12,\n" +
 	"\x12client_artifact_id\x18\x02 \x01(\tR\x10clientArtifactId\x12\x12\n" +

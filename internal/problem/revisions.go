@@ -1,6 +1,7 @@
 package problem
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -33,6 +35,7 @@ type Manager struct {
 	Pool      *pgxpool.Pool
 	Artifacts *artifact.Store
 	Renderer  *statement.Renderer
+	EnableLua bool
 }
 type Revision struct {
 	ID        string  `json:"id"`
@@ -69,7 +72,7 @@ func (m Manager) List(ctx context.Context, id string) ([]Revision, error) {
 	return items, err
 }
 func (m Manager) Create(ctx context.Context, id string, in RevisionInput) (out Revision, err error) {
-	if (in.Format != "standard" && in.Format != "scripted_lua") || (in.GraderMode != "" && in.GraderMode != "manual") {
+	if (in.Format != "standard" && in.Format != "scripted_lua") || (in.GraderMode != "" && in.GraderMode != "manual" && in.GraderMode != "automatic_submission") {
 		return out, ErrInvalid
 	}
 	out.Format = in.Format
@@ -166,13 +169,27 @@ func (m Manager) SetLanguage(ctx context.Context, problem, rev, code string) err
 		return nil
 	})
 }
+func (m Manager) RemoveLanguage(ctx context.Context, problem, rev, code string) error {
+	return db.Tx(ctx, m.Pool, func(tx pgx.Tx) error {
+		if err := draft(ctx, tx, problem, rev); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM problem_revision_languages WHERE revision_id=$1 AND language_id=(SELECT id FROM languages WHERE code=$2)`, rev, code)
+		return err
+	})
+}
+
 func (m Manager) SetPackage(ctx context.Context, user, problem, rev string, data []byte) error {
 	var format string
-	if err := m.Pool.QueryRow(ctx, `SELECT execution_format FROM problem_revisions WHERE id=$1 AND problem_id=$2 AND status='draft'`, rev, problem).Scan(&format); err != nil {
+	var graderMode *string
+	if err := m.Pool.QueryRow(ctx, `SELECT execution_format,grader_mode FROM problem_revisions WHERE id=$1 AND problem_id=$2 AND status='draft'`, rev, problem).Scan(&format, &graderMode); err != nil {
 		return err
 	}
 	files, err := Files(data)
 	if err != nil {
+		return err
+	}
+	if _, err := extractGraderScript(files, graderMode); err != nil {
 		return err
 	}
 	switch format {
@@ -218,10 +235,10 @@ type revisionManifest struct {
 func (m Manager) Validate(ctx context.Context, problem, rev string) error {
 	return db.Tx(ctx, m.Pool, func(tx pgx.Tx) error {
 		meta, source, err := manifest(ctx, tx, problem, rev)
-		if err != nil || meta.Format != "standard" {
+		if err != nil {
 			return err
 		}
-		_, err = m.packageFiles(ctx, source, &meta)
+		_, _, err = m.packageFiles(ctx, source, &meta)
 		return err
 	})
 }
@@ -281,7 +298,7 @@ func (m Manager) Publish(ctx context.Context, user, problem, rev string) error {
 		if err != nil {
 			return err
 		}
-		files, err := m.packageFiles(ctx, source, &manifest)
+		files, script, err := m.packageFiles(ctx, source, &manifest)
 		if err != nil {
 			return err
 		}
@@ -298,39 +315,73 @@ func (m Manager) Publish(ctx context.Context, user, problem, rev string) error {
 		if err != nil {
 			return err
 		}
-		if _, err = tx.Exec(ctx, `UPDATE problem_revisions SET bundle_artifact_id=$2,digest=$3,manifest=$4,status='published',published_at=now() WHERE id=$1`, rev, ref.ID, ref.Digest, data); err != nil {
+		var graderScript *string
+		if script != nil {
+			stored, err := m.Artifacts.PutTx(ctx, tx, user, "grader-script", "text/x-python", script)
+			if err != nil {
+				return err
+			}
+			graderScript = &stored.ID
+		}
+		if _, err = tx.Exec(ctx, `UPDATE problem_revisions SET bundle_artifact_id=$2,digest=$3,manifest=$4,grader_script_artifact_id=$5,status='published',published_at=now() WHERE id=$1`, rev, ref.ID, ref.Digest, data, graderScript); err != nil {
 			return err
 		}
 		return db.Audit(ctx, tx, user, "revision.publish", rev)
 	})
 }
 
-func (m Manager) packageFiles(ctx context.Context, source string, meta *revisionManifest) (map[string][]byte, error) {
+func extractGraderScript(files map[string][]byte, mode *string) ([]byte, error) {
+	script, exists := files["grader.py"]
+	if !exists {
+		return nil, nil
+	}
+	if mode == nil || len(script) == 0 || len(script) > MaxPackageText || !utf8.Valid(script) || bytes.ContainsRune(script, 0) {
+		return nil, fmt.Errorf("%w: grader.py requires Grader mode and nonempty UTF-8 text up to 256 KiB", ErrInvalid)
+	}
+	delete(files, "grader.py")
+	return script, nil
+}
+
+func (m Manager) packageFiles(ctx context.Context, source string, meta *revisionManifest) (map[string][]byte, []byte, error) {
 	original, err := m.Artifacts.Read(ctx, source, MaxPackageBytes)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if fmt.Sprintf("%x", sha256.Sum256(original)) != meta.Source {
-		return nil, errors.New("revision source digest mismatch")
+		return nil, nil, errors.New("revision source digest mismatch")
 	}
 	files, err := Files(original)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if _, exists := files["podtest-manifest.json"]; exists {
-		return nil, ErrReservedFile
+		return nil, nil, ErrReservedFile
+	}
+	script, err := extractGraderScript(files, meta.GraderMode)
+	if err != nil {
+		return nil, nil, err
 	}
 	if meta.Format == "standard" {
 		language, err := validateStandard(files)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if len(meta.Languages) != 1 || meta.Languages[0] != language {
-			return nil, fmt.Errorf("%w: enable only the language declared in standard.json", ErrInvalid)
+			return nil, nil, fmt.Errorf("%w: enable only the language declared in standard.json", ErrInvalid)
 		}
 		meta.ExecutionReady = true
 	}
-	return files, nil
+	if meta.Format == "scripted_lua" && m.EnableLua && meta.RunnerVersion == 1 && len(meta.Languages) == 1 && meta.Languages[0] == "posix_sh" {
+		const maxRunnerBytes = 256 << 10
+		if len(files["runner.lua"]) > maxRunnerBytes {
+			return nil, nil, fmt.Errorf("%w: runner.lua exceeds 256 KiB", ErrInvalid)
+		}
+		meta.ExecutionReady = true
+	}
+	if meta.Format == "scripted_lua" && len(files["runner.lua"]) == 0 {
+		return nil, nil, ErrMissingRunner
+	}
+	return files, script, nil
 }
 
 func buildRevisionBundle(manifest revisionManifest, files map[string][]byte) ([]byte, error) {
@@ -355,6 +406,7 @@ type ContestProblem struct {
 	Title             string  `json:"title"`
 	Position          int     `json:"position"`
 	MaxScore          string  `json:"max_score"`
+	SubmissionLimit   *int    `json:"submission_limit"`
 	VerdictVisibility string  `json:"verdict_visibility"`
 	GraderMode        *string `json:"grader_mode"`
 }
@@ -368,7 +420,7 @@ type AttachInput struct {
 }
 
 func (m Manager) ContestList(ctx context.Context, contest string) ([]ContestProblem, error) {
-	rows, err := m.Pool.Query(ctx, `SELECT cp.id,cp.problem_id,cp.problem_revision_id,p.title,cp.position,cp.max_score::text,cp.verdict_visibility,r.grader_mode FROM contest_problems cp JOIN problems p ON p.id=cp.problem_id JOIN problem_revisions r ON r.id=cp.problem_revision_id WHERE cp.contest_id=$1 AND cp.detached_at IS NULL ORDER BY cp.position,cp.id LIMIT 250`, contest)
+	rows, err := m.Pool.Query(ctx, `SELECT cp.id,cp.problem_id,cp.problem_revision_id,p.title,cp.position,cp.max_score::text,cp.submission_limit,cp.verdict_visibility,r.grader_mode FROM contest_problems cp JOIN problems p ON p.id=cp.problem_id JOIN problem_revisions r ON r.id=cp.problem_revision_id WHERE cp.contest_id=$1 AND cp.detached_at IS NULL ORDER BY cp.position,cp.id LIMIT 250`, contest)
 	if err != nil {
 		return nil, err
 	}
@@ -402,11 +454,40 @@ func (m Manager) Attach(ctx context.Context, user, contest string, in AttachInpu
 
 var scoreRE = regexp.MustCompile(`^[0-9]{1,12}(\.[0-9]{1,6})?$`)
 
+func (m Manager) PinnedRevisions(ctx context.Context, contest, cp string) ([]Revision, error) {
+	rows, err := m.Pool.Query(ctx, `SELECT r.id,r.revision_number,r.execution_format,r.status,r.digest,0
+		FROM contest_problems cp JOIN problem_revisions r ON r.problem_id=cp.problem_id
+		WHERE cp.contest_id=$1 AND cp.id=$2 AND cp.detached_at IS NULL AND r.status='published'
+		ORDER BY (r.id=cp.problem_revision_id) DESC,r.revision_number DESC LIMIT 250`, contest, cp)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[Revision])
+}
+
 func (m Manager) Switch(ctx context.Context, user, contest, cp, revision string) error {
+	return m.Configure(ctx, user, contest, cp, revision, nil)
+}
+
+type ContestProblemSettings struct {
+	SubmissionLimit   *int   `json:"submission_limit"`
+	VerdictVisibility string `json:"verdict_visibility"`
+}
+
+func (m Manager) Configure(ctx context.Context, user, contest, cp, revision string, settings *ContestProblemSettings) error {
+	if settings != nil && ((settings.SubmissionLimit != nil && *settings.SubmissionLimit < 1) ||
+		(settings.VerdictVisibility != "hidden" && settings.VerdictVisibility != "summary" && settings.VerdictVisibility != "tests")) {
+		return ErrInvalid
+	}
 	return db.Tx(ctx, m.Pool, func(tx pgx.Tx) error {
 		var id string
 		if err := tx.QueryRow(ctx, `UPDATE contest_problems cp SET problem_revision_id=r.id FROM problem_revisions r WHERE cp.id=$1 AND cp.contest_id=$2 AND cp.detached_at IS NULL AND r.id=$3 AND r.problem_id=cp.problem_id AND r.status='published' RETURNING cp.id`, cp, contest, revision).Scan(&id); err != nil {
 			return err
+		}
+		if settings != nil {
+			if _, err := tx.Exec(ctx, `UPDATE contest_problems SET submission_limit=$2,verdict_visibility=$3 WHERE id=$1`, id, settings.SubmissionLimit, settings.VerdictVisibility); err != nil {
+				return err
+			}
 		}
 		return db.Audit(ctx, tx, user, "contest.problem.switch_revision", id)
 	})
@@ -425,16 +506,20 @@ func (m Manager) Detach(ctx context.Context, user, contest, cp string) error {
 }
 
 type Task struct {
-	ID         string      `json:"id"`
-	Title      string      `json:"title"`
-	RevisionID string      `json:"problem_revision_id"`
-	Statements []Statement `json:"statements"`
-	Languages  []Language  `json:"languages"`
+	ID                 string      `json:"id"`
+	Title              string      `json:"title"`
+	RevisionID         string      `json:"problem_revision_id"`
+	ExecutionAvailable bool        `json:"execution_available"`
+	Statements         []Statement `json:"statements"`
+	Languages          []Language  `json:"languages"`
 }
 
 func (m Manager) Task(ctx context.Context, contest, cp string) (t Task, err error) {
 	var problem string
-	err = m.Pool.QueryRow(ctx, `SELECT cp.id,p.title,cp.problem_revision_id,p.id FROM contest_problems cp JOIN problems p ON p.id=cp.problem_id JOIN contests c ON c.id=cp.contest_id WHERE cp.id=$1 AND cp.contest_id=$2 AND cp.detached_at IS NULL AND c.archived_at IS NULL`, cp, contest).Scan(&t.ID, &t.Title, &t.RevisionID, &problem)
+	err = m.Pool.QueryRow(ctx, `SELECT cp.id,p.title,cp.problem_revision_id,p.id,`+RunnableRevisionSQL+`
+		FROM contest_problems cp JOIN problems p ON p.id=cp.problem_id JOIN contests c ON c.id=cp.contest_id
+		JOIN problem_revisions r ON r.id=cp.problem_revision_id
+		WHERE cp.id=$1 AND cp.contest_id=$2 AND cp.detached_at IS NULL AND c.archived_at IS NULL`, cp, contest).Scan(&t.ID, &t.Title, &t.RevisionID, &problem, &t.ExecutionAvailable)
 	if err != nil {
 		return
 	}

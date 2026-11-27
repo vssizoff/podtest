@@ -4,6 +4,7 @@ import { RouterLink, useRoute } from 'vue-router'
 import { api } from '../api/client'
 import type { Contest, Course, Page } from '../api/types'
 import TermButton from '../components/termui/TermButton.vue'
+import ResourceMembers from '../components/ResourceMembers.vue'
 
 const path = `/courses/${String(useRoute().params.id)}`
 const course = ref<Course>()
@@ -70,4 +71,5 @@ async function attach() {
       <TermButton type="submit" :disabled="busy || !selected">Link contest</TermButton>
     </form>
   </section>
+  <ResourceMembers v-if="course?.can_manage" :path="`${path}/members`" :roles="['manager', 'teacher', 'student', 'viewer']" />
 </template>

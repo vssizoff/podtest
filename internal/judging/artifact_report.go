@@ -28,6 +28,7 @@ func (s *ArtifactControl) Report(ctx context.Context, req *pb.Event) (*pb.Acknow
 	}
 	var terminalState string
 	var resultKind string
+	var progressKind string
 	switch req.Kind {
 	case pb.Event_ARTIFACT_CREATED:
 		if req.Outcome != "" || !canonicalUUID(req.ArtifactId) {
@@ -47,9 +48,20 @@ func (s *ArtifactControl) Report(ctx context.Context, req *pb.Event) (*pb.Acknow
 		if req.ArtifactId != "" {
 			return nil, status.Error(codes.InvalidArgument, "report artifacts separately")
 		}
+	case pb.Event_RUN_CANCELLED:
+		if req.Outcome != "" || req.ArtifactId != "" {
+			return nil, status.Error(codes.InvalidArgument, "invalid cancellation fields")
+		}
+		terminalState = "cancelled"
 	case pb.Event_TEST_FINISHED, pb.Event_SUBGROUP_SCORE, pb.Event_PROBLEM_SCORE:
 		var err error
 		resultKind, err = validateResultReport(req)
+		if err != nil {
+			return nil, err
+		}
+	case pb.Event_RUN_STARTED, pb.Event_BUILD_STARTED, pb.Event_BUILD_FINISHED, pb.Event_TEST_STARTED:
+		var err error
+		progressKind, err = validateProgressReport(req)
 		if err != nil {
 			return nil, err
 		}
@@ -64,7 +76,7 @@ func (s *ArtifactControl) Report(ctx context.Context, req *pb.Event) (*pb.Acknow
 		len(req.ProtoReflect().GetUnknown()) != 0 {
 		return nil, status.Error(codes.InvalidArgument, "invalid run event")
 	}
-	if resultKind == "" && (req.Score != nil || req.TestId != "" || req.SubgroupId != "" ||
+	if resultKind == "" && progressKind == "" && (req.Score != nil || req.TestId != "" || req.SubgroupId != "" ||
 		(terminalState == "finished" && !validReportVerdict(req.Verdict)) || (terminalState != "finished" && req.Verdict != "")) {
 		return nil, status.Error(codes.InvalidArgument, "invalid terminal or artifact fields")
 	}
@@ -76,7 +88,7 @@ func (s *ArtifactControl) Report(ctx context.Context, req *pb.Event) (*pb.Acknow
 	digest := hex.EncodeToString(sum[:])
 	var out pb.Acknowledgement
 	err = db.Tx(ctx, s.Pool, func(tx pgx.Tx) error {
-		var active bool
+		var active, cancelRequested bool
 		var token []byte
 		var last int64
 		err := tx.QueryRow(ctx, `SELECT fencing_token,last_sequence FROM judging_attempts
@@ -103,18 +115,24 @@ func (s *ArtifactControl) Report(ctx context.Context, req *pb.Event) (*pb.Acknow
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
-		if err := tx.QueryRow(ctx, `SELECT coalesce(status IN ('assigned','running') AND lease_until>clock_timestamp(),false)
-			FROM judging_attempts WHERE id=$1`, req.AttemptId).Scan(&active); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT coalesce(status IN ('assigned','running') AND lease_until>clock_timestamp(),false),
+			cancel_requested_at IS NOT NULL FROM judging_attempts WHERE id=$1`, req.AttemptId).Scan(&active, &cancelRequested); err != nil {
 			return err
 		}
 		if !active || int64(req.Sequence)-1 != last {
 			return status.Error(codes.FailedPrecondition, "inactive lease or unexpected event sequence")
 		}
 		if terminalState != "" {
+			if terminalState == "cancelled" && !cancelRequested {
+				return status.Error(codes.FailedPrecondition, "no cancellation requested")
+			}
 			return finishReportedRun(ctx, tx, req, id, digest, terminalState)
 		}
 		if resultKind != "" {
 			return recordResultReport(ctx, tx, req, id, digest, resultKind)
+		}
+		if progressKind != "" {
+			return recordProgressReport(ctx, tx, req, id, digest, progressKind)
 		}
 		tag, err := tx.Exec(ctx, `INSERT INTO judging_events(event_id,attempt_id,run_id,sequence,schema_version,kind,payload,occurred_at)
 			SELECT $1,g.attempt_id,g.run_id,$4,1,'artifact_created',jsonb_build_object('artifact_id',g.id,'kind',g.kind,'report_digest',$5::text),$6
@@ -163,5 +181,12 @@ func finishReportedRun(ctx context.Context, tx pgx.Tx, req *pb.Event, id uuid.UU
 		return status.Error(codes.FailedPrecondition, "run lease expired")
 	}
 	_, err = tx.Exec(ctx, `UPDATE queue_entries SET status='done' WHERE attempt_id=$1 AND status='assigned'`, req.AttemptId)
+	if err == nil && state == "finished" {
+		_, err = tx.Exec(ctx, `INSERT INTO grader_triggers(attempt_id,contest_problem_id)
+			SELECT j.id,cp.id FROM judging_attempts j JOIN submissions s ON s.id=j.submission_id
+			JOIN contest_problems cp ON cp.id=s.contest_problem_id JOIN problem_revisions r ON r.id=cp.problem_revision_id
+			WHERE j.id=$1 AND cp.detached_at IS NULL AND r.grader_mode='automatic_submission'
+			ON CONFLICT DO NOTHING`, req.AttemptId)
+	}
 	return err
 }

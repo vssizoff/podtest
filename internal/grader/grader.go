@@ -16,16 +16,21 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"podtest/internal/artifact"
 	"podtest/internal/db"
 )
 
 var ErrInvalid = errors.New("invalid grader snapshot or scores")
 var decimal = regexp.MustCompile(`^(0|[1-9][0-9]{0,11})(\.[0-9]{1,6})?$`)
 
-type Manager struct{ Pool *pgxpool.Pool }
+type Manager struct {
+	Pool      *pgxpool.Pool
+	Artifacts *artifact.Store
+}
 type Input struct {
-	SubmissionID string  `json:"submission_id"`
-	AttemptID    *string `json:"judging_attempt_id"`
+	SubmissionID  string  `json:"submission_id"`
+	AttemptID     *string `json:"judging_attempt_id"`
+	ParticipantID string  `json:"participant_id"`
 }
 type Run struct {
 	ID             string    `json:"id"`
@@ -58,6 +63,14 @@ func (m Manager) Create(ctx context.Context, actor, contest, cp, trigger, mode s
 		return out, scope, ErrInvalid
 	}
 	err = db.Tx(ctx, m.Pool, func(tx pgx.Tx) error {
+		out, scope, err = m.createTx(ctx, tx, actor, contest, cp, trigger, mode)
+		return err
+	})
+	return
+}
+
+func (m Manager) createTx(ctx context.Context, tx pgx.Tx, actor, contest, cp, trigger, mode string) (out Run, scope Scope, err error) {
+	err = func() error {
 		var max string
 		var graderMode *string
 		if err := tx.QueryRow(ctx, `SELECT cp.max_score::text,r.grader_mode FROM contest_problems cp JOIN problem_revisions r ON r.id=cp.problem_revision_id WHERE cp.id=$1 AND cp.contest_id=$2 AND cp.detached_at IS NULL FOR UPDATE OF cp`, cp, contest).Scan(&max, &graderMode); err != nil {
@@ -78,14 +91,15 @@ func (m Manager) Create(ctx context.Context, actor, contest, cp, trigger, mode s
 			return err
 		}
 		scope.Participants = participants
-		rows, err := tx.Query(ctx, `SELECT s.id,j.id,s.participant_id FROM submissions s JOIN judging_attempts j ON j.submission_id=s.id WHERE s.contest_problem_id=$1 AND j.id=(SELECT a.id FROM judging_attempts a WHERE a.submission_id=s.id ORDER BY a.attempt_number DESC LIMIT 1) AND j.status IN ('finished','error','timeout') ORDER BY s.id,j.id`, cp)
+		rows, err := tx.Query(ctx, `SELECT s.id,j.id,s.participant_id FROM submissions s JOIN judging_attempts j ON j.submission_id=s.id
+			WHERE s.contest_problem_id=$1 AND s.participant_id=ANY($2::uuid[])
+			AND j.id=(SELECT a.id FROM judging_attempts a WHERE a.submission_id=s.id ORDER BY a.attempt_number DESC LIMIT 1) AND j.status IN ('finished','error','timeout') ORDER BY s.id,j.id LIMIT 100001`, cp, participants)
 		if err != nil {
 			return err
 		}
 		for rows.Next() {
 			var in Input
-			var participant string
-			if err := rows.Scan(&in.SubmissionID, &in.AttemptID, &participant); err != nil {
+			if err := rows.Scan(&in.SubmissionID, &in.AttemptID, &in.ParticipantID); err != nil {
 				rows.Close()
 				return err
 			}
@@ -131,7 +145,7 @@ func (m Manager) Create(ctx context.Context, actor, contest, cp, trigger, mode s
 			}
 		}
 		return db.Audit(ctx, tx, actor, "grader.create", out.ID)
-	})
+	}()
 	return
 }
 
@@ -158,8 +172,7 @@ func (m Manager) Snapshot(ctx context.Context, run, token string) (Run, Scope, e
 	inputs := []Input{}
 	for rows.Next() {
 		var in Input
-		var participant string
-		if err := rows.Scan(&in.SubmissionID, &in.AttemptID, &participant); err != nil {
+		if err := rows.Scan(&in.SubmissionID, &in.AttemptID, &in.ParticipantID); err != nil {
 			return Run{}, Scope{}, err
 		}
 		inputs = append(inputs, in)
@@ -168,6 +181,9 @@ func (m Manager) Snapshot(ctx context.Context, run, token string) (Run, Scope, e
 }
 
 func (m Manager) Submit(ctx context.Context, run, token string, p ScorePayload) error {
+	if len(p.Log) > 1<<20 {
+		return ErrInvalid
+	}
 	out, scope, err := m.Snapshot(ctx, run, token)
 	if err != nil {
 		return err
@@ -193,7 +209,7 @@ func (m Manager) Submit(ctx context.Context, run, token string, p ScorePayload) 
 		if !ok || !decimal.MatchString(s.Value) || v.Sign() < 0 || v.Cmp(maxValue) > 0 || !allowedP[s.ParticipantID] || s.ContestProblemID != out.ProblemID || seen[s.ParticipantID] {
 			return ErrInvalid
 		}
-		if len(s.Metadata) > 8192 || len(p.Log) > 1<<20 {
+		if len(s.Metadata) > 8192 {
 			return ErrInvalid
 		}
 		var meta any
@@ -209,13 +225,14 @@ func (m Manager) Submit(ctx context.Context, run, token string, p ScorePayload) 
 	}
 	return db.Tx(ctx, m.Pool, func(tx pgx.Tx) error {
 		var status string
-		if err := tx.QueryRow(ctx, `SELECT status FROM grader_runs WHERE id=$1 FOR UPDATE`, run).Scan(&status); err != nil {
+		h := sha256.Sum256([]byte(token))
+		if err := tx.QueryRow(ctx, `SELECT status FROM grader_runs WHERE id=$1 AND capability_hash=$2 AND capability_expires_at>clock_timestamp() FOR UPDATE`, run, h[:]).Scan(&status); err != nil {
 			return err
 		}
 		if status != "pending" && status != "running" {
 			return ErrInvalid
 		}
-		if _, err := tx.Exec(ctx, `UPDATE grader_runs SET status='completed',finished_at=now() WHERE id=$1`, run); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE grader_runs SET status='completed',finished_at=now(),log=$2 WHERE id=$1`, run, p.Log); err != nil {
 			return err
 		}
 		for _, s := range p.Scores {
@@ -258,6 +275,11 @@ func (m Manager) Publish(ctx context.Context, actor, run string) (string, error)
 		if status != "completed" {
 			return ErrInvalid
 		}
+		if err := tx.QueryRow(ctx, `SELECT id FROM score_publications WHERE grader_run_id=$1`, run).Scan(&publication); err == nil {
+			return nil
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
 		publication = uuid.NewString()
 		if _, err := tx.Exec(ctx, `INSERT INTO score_publications(id,contest_id,grader_run_id,created_by) VALUES($1,$2,$3,NULLIF($4,'')::uuid)`, publication, contest, run, actor); err != nil {
 			return err
@@ -266,7 +288,7 @@ func (m Manager) Publish(ctx context.Context, actor, run string) (string, error)
 		if err := tx.QueryRow(ctx, `SELECT current_score_publication_id FROM contests WHERE id=$1 FOR UPDATE`, contest).Scan(&current); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO score_publication_values(publication_id,participant_id,contest_problem_id,score) SELECT $1,participant_id,contest_problem_id,score FROM score_publication_values WHERE publication_id=$3 AND contest_problem_id<>$4 UNION ALL SELECT $1,participant_id,contest_problem_id,score FROM grader_scores WHERE grader_run_id=$2`, publication, run, current, cp); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO score_publication_values(publication_id,participant_id,contest_problem_id,score) SELECT $1::uuid,participant_id,contest_problem_id,score FROM score_publication_values WHERE publication_id=$3 AND contest_problem_id<>$4 UNION ALL SELECT $1::uuid,participant_id,contest_problem_id,score FROM grader_scores WHERE grader_run_id=$2`, publication, run, current, cp); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE contests SET current_score_publication_id=$1 WHERE id=$2`, publication, contest); err != nil {

@@ -8,9 +8,10 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	pb "podtest/internal/invokerpb"
+	"podtest/internal/problem"
 )
 
-func reserveQueuedStandard(ctx context.Context, tx pgx.Tx, req *pb.RunLease) error {
+func reserveQueued(ctx context.Context, tx pgx.Tx, req *pb.RunLease) error {
 	if err := authenticate(ctx, req.GetInvokerId()); err != nil {
 		return err
 	}
@@ -34,22 +35,22 @@ func reserveQueuedStandard(ctx context.Context, tx pgx.Tx, req *pb.RunLease) err
 		return err
 	}
 	var eligible bool
-	err = tx.QueryRow(ctx, `SELECT r.status='published' AND r.execution_format='standard' AND r.format_version=1
-		AND coalesce(r.manifest->'execution_ready'='true'::jsonb AND r.manifest->>'package_format'='ustar_v1',false)
-		FROM judging_attempts j JOIN problem_revisions r ON r.id=j.target_problem_revision_id WHERE j.id=$1`, req.AttemptId).Scan(&eligible)
+	var executionFormat string
+	err = tx.QueryRow(ctx, `SELECT `+problem.RunnableRevisionSQL+`,r.execution_format
+		FROM judging_attempts j JOIN problem_revisions r ON r.id=j.target_problem_revision_id WHERE j.id=$1`, req.AttemptId).Scan(&eligible, &executionFormat)
 	if err != nil {
 		return err
 	}
 	if !eligible {
-		return status.Error(codes.FailedPrecondition, "revision not ready for Standard execution")
+		return status.Error(codes.FailedPrecondition, "revision not ready for execution")
 	}
 	// Serialize reservations across concurrent Claims from the same Invoker.
 	var capacity, load int
 	err = tx.QueryRow(ctx, `SELECT capacity,load FROM invokers WHERE id=$1 AND protocol_version=1
-		AND 'standard'=ANY(capabilities) AND last_heartbeat>clock_timestamp()-interval '30 seconds'
-		FOR UPDATE`, req.InvokerId).Scan(&capacity, &load)
+		AND $2=ANY(capabilities) AND last_heartbeat>clock_timestamp()-interval '30 seconds'
+		FOR UPDATE`, req.InvokerId, executionFormat).Scan(&capacity, &load)
 	if errors.Is(err, pgx.ErrNoRows) || (err == nil && load >= capacity) {
-		return status.Error(codes.ResourceExhausted, "no advertised Standard capacity")
+		return status.Error(codes.ResourceExhausted, "no advertised capacity for execution format")
 	}
 	if err != nil {
 		return err

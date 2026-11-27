@@ -7,6 +7,7 @@ from html.parser import HTMLParser
 from io import BytesIO
 from decimal import Decimal
 import json
+import os
 import sys
 from pathlib import Path
 from time import monotonic, sleep
@@ -17,7 +18,7 @@ from zipfile import ZipFile
 import requests
 
 
-BASE = "http://localhost:8088"
+BASE = os.environ.get("PODTEST_SMOKE_URL", "http://localhost:8088")
 
 
 class LoginForm(HTMLParser):
@@ -38,11 +39,16 @@ def archive(path, content, extra=None):
     return {"file": ("smoke.zip", buf.getvalue(), "application/zip")}
 
 
-def login_session(s):
+def login_session(s, email="smoke@podtest.test"):
     s.trust_env = False
 
     def call(method, path, status=200, **kwargs):
-        response = s.request(method, BASE + path, allow_redirects=False, timeout=15, **kwargs)
+        for attempt in range(8):
+            response = s.request(method, BASE + path, allow_redirects=False, timeout=15, **kwargs)
+            if response.status_code != 429 or status == 429 or attempt == 7:
+                break
+            response.close()
+            sleep(0.3)
         assert response.status_code == status, (method, path.split("?")[0], response.status_code, response.text)
         return response
 
@@ -51,7 +57,12 @@ def login_session(s):
     assert dex.startswith(BASE + "/dex/")
     local_url = dex
     for _ in range(5):
-        page = s.get(local_url, allow_redirects=False, timeout=15)
+        for attempt in range(8):
+            page = s.get(local_url, allow_redirects=False, timeout=15)
+            if page.status_code != 429 or attempt == 7:
+                break
+            page.close()
+            sleep(0.3)
         if page.status_code == 200:
             break
         assert page.status_code == 302, page.status_code
@@ -64,7 +75,7 @@ def login_session(s):
     assert form.action
     action = urljoin(local_url, form.action)
     assert action.startswith(BASE + "/dex/")
-    callback = call("POST", action.removeprefix(BASE), 303, data={"login": "smoke@podtest.test", "password": "podtest-local"})
+    callback = call("POST", action.removeprefix(BASE), 303, data={"login": email, "password": "podtest-local"})
     target = callback.headers["Location"]
     assert target.startswith(BASE + "/auth/callback?")
     call("GET", target.removeprefix(BASE), 303)
@@ -90,8 +101,15 @@ def smoke(s):
     assert "Smoke test" in call("GET", draft + "/statements").json()["items"][0]["html"]
     assert "runner.lua" in call("PUT", draft + "/package", 422, files=archive("nested/runner.lua", "return {}\n")).json()["error"]["message"]
     call("PUT", draft + "/package", 204, files=archive("runner.lua", "return {}\n"))
+    files = draft + "/package/files"
+    assert call("GET", files, params={"name": "runner.lua"}).json()["text"] == "return {}\n"
+    call("PATCH", files, 422, json={"name": "../escape", "text": "fixture"})
+    call("PATCH", files, 204, json={"name": "runner.lua", "remove": True})
+    call("POST", draft + "/validate", 422)
+    call("PATCH", files, 204, json={"name": "runner.lua", "text": "return {}\n"})
     assert call("POST", draft + "/validate").json()["valid"]
     call("POST", draft + "/publish", 204)
+    call("PATCH", files, 409, json={"name": "runner.lua", "text": "immutable"})
     assert call("GET", path + "/revisions").json()["items"][0]["status"] == "published"
     call("PUT", draft + "/statements/en", 409, json={"source": "Cannot edit a publication"})
     report = call("POST", "/api/v1/problems/import/polygon", files=archive("problem.xml", '<problem><names><name value="Polygon smoke"/></names></problem>')).json()
@@ -107,28 +125,31 @@ def smoke(s):
 
     contest_path = f"/api/v1/contests/{contest}"
     problems = contest_path + "/problems"
-    call("POST", problems, 201, json={"problem_id": problem, "problem_revision_id": revision, "position": 0, "max_score": "100", "verdict_visibility": "summary"})
+    lua = call("POST", problems, 201, json={"problem_id": problem, "problem_revision_id": revision, "position": 0, "max_score": "100", "verdict_visibility": "summary"}).json()["id"]
     full = archive("problem.xml", '<problem><names><name value="Full Polygon smoke"/></names></problem>', {"tests/01": "1 2\n", "tests/01.a": "3\n", "check.cpp": "// retained fixture\n"})
     imported = call("POST", problems + "/import/polygon", 201, files=full).json()
     cp = imported["contest_problem_id"]
     assert len(call("GET", problems).json()["items"]) == 2
     task = call("GET", f"{problems}/{cp}").json()
     assert task["problem_revision_id"] == imported["revision_id"]
-    assert "python3" in [entry["code"] for entry in task["languages"]]
+    assert task["execution_available"] is False
+    assert call("GET", f"{problems}/{lua}").json()["execution_available"] is False
     call("PATCH", contest_path + "/settings", json={"status": "open", "self_registration": True, "scoreboard_visibility": "contest"})
     call("POST", contest_path + "/participants", 204, json={"self": True})
-    submission = call("POST", f"{problems}/{cp}/submissions", 202, data={"language": "python3"}, files={"source": ("answer.py", b"print(3)\n")}).json()
-    assert submission["problem_revision_id"] == imported["revision_id"]
-    with call("GET", f"/api/v1/submissions/{submission['id']}/events", stream=True) as events:
-        deadline = monotonic() + 12
-        for line in events.iter_lines(chunk_size=1):
-            if b'"verdict":"testing_error"' in line:
-                break
-            assert monotonic() < deadline, "No testing_error event within deadline"
-        else:
-            raise AssertionError("No testing_error event")
-    attempt = call("GET", f"/api/v1/submissions/{submission['id']}/attempts").json()["items"][0]
-    assert attempt["status"] == "error" and attempt["verdict"] == "testing_error"
+    material = call("POST", "/api/v1/materials", 201, json={"title": prefix + " notes"}).json()["id"]
+    revisions = f"/api/v1/materials/{material}/revisions"
+    first = call("POST", revisions, 201, data={"format": "markdown", "source": "# First version"}, files={"file": ("notes.txt", b"fixture attachment")}).json()
+    second = call("POST", revisions, 201, json={"format": "markdown", "source": "# Second version"}).json()
+    assert [item["id"] for item in call("GET", revisions).json()["items"]] == [second["id"], first["id"]]
+    call("POST", contest_path + "/materials", 204, json={"material_id": material, "material_revision_id": first["id"], "position": 0, "visibility": "managers"})
+    pinned = call("GET", contest_path + "/materials").json()["items"][0]
+    assert pinned["material_revision_id"] == first["id"] and "First version" in pinned["rendered_html"]
+    assert call("GET", f"{contest_path}/materials/{material}/attachment").content == b"fixture attachment"
+    for task_id in (cp, lua):
+        path = f"{problems}/{task_id}/submissions"
+        err = call("POST", path, 409, data={"language": "python3"}, files={"source": ("answer.py", b"print(3)\n")}).json()
+        assert err["error"]["code"] == "execution_unavailable"
+        assert call("GET", path + "/me").json()["items"] == []
     call("POST", "/auth/logout", 204)
     print(f"Authoring smoke passed: {prefix}")
 
@@ -150,9 +171,19 @@ def smoke_standard(s):
     }
     package = archive("standard.json", json.dumps(manifest), {"tests/input": "hello\n", "tests/answer": "hello\n"})
     call("PUT", draft + "/package", 204, files=package)
+    files = draft + "/package/files"
+    assert call("GET", files, params={"name": "tests/input"}).json()["text"] == "hello\n"
+    call("PATCH", files, 422, json={"name": "../escape", "text": "fixture"})
+    call("PATCH", files, 204, json={"name": "tests/input", "text": "edited\n"})
+    assert call("GET", files, params={"name": "tests/input"}).json()["text"] == "edited\n"
+    call("PATCH", files, 204, json={"name": "tests/input", "text": "hello\n"})
+    call("PATCH", files, 204, json={"name": "notes.txt", "text": "temporary file"})
+    call("PATCH", files, 204, json={"name": "notes.txt", "remove": True})
+    assert "notes.txt" not in call("GET", files).json()["files"]
     validation = call("POST", draft + "/validate").json()
     assert validation["valid"], validation
     call("POST", draft + "/publish", 204)
+    call("PATCH", files, 409, json={"name": "tests/input", "text": "immutable"})
 
     contest = call("POST", "/api/v1/contests", 201, json={"title": title}).json()["id"]
     path = f"/api/v1/contests/{contest}"
@@ -160,6 +191,7 @@ def smoke_standard(s):
         "problem_id": problem, "problem_revision_id": revision, "position": 0,
         "max_score": "1", "verdict_visibility": "tests",
     }).json()["id"]
+    assert call("GET", f"{path}/problems/{task}").json()["execution_available"] is True
     call("PATCH", path + "/settings", json={"status": "open", "self_registration": True, "scoreboard_visibility": "contest"})
     call("POST", path + "/participants", 204, json={"self": True})
     submission = call("POST", f"{path}/problems/{task}/submissions", 202,

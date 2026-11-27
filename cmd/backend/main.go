@@ -15,6 +15,7 @@ import (
 	"podtest/internal/auth"
 	"podtest/internal/authorization"
 	"podtest/internal/db"
+	"podtest/internal/grader"
 	"podtest/internal/judging"
 	"podtest/internal/web"
 )
@@ -43,6 +44,13 @@ func run() error {
 	defer pool.Close()
 	if mode == "migrate" {
 		return db.Migrate(ctx, pool)
+	}
+	if mode == "grader-worker" {
+		store, err := artifact.New(pool)
+		if err != nil {
+			return err
+		}
+		return (grader.Manager{Pool: pool, Artifacts: store}).Work(ctx, os.Getenv("GRADER_IMAGE_ID"))
 	}
 	fga := &authorization.HTTPClient{URL: os.Getenv("FGA_URL"), Token: os.Getenv("FGA_TOKEN"), Store: os.Getenv("FGA_STORE_ID"), Model: os.Getenv("FGA_MODEL_ID"), StateFile: os.Getenv("FGA_STATE_FILE")}
 	if mode == "worker" {

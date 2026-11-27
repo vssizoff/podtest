@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -34,7 +36,15 @@ func TestStandardSubmissionExecution(t *testing.T) {
 	if url == "" || socket == "" || image == "" {
 		t.Fatal("set PODTEST_NATS_URL, PODTEST_PODMAN_SOCKET and PODTEST_STANDARD_SH_IMAGE_ID")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Second)
+	load := 0
+	if value := os.Getenv("PODTEST_STANDARD_LOAD"); value != "" {
+		var err error
+		load, err = strconv.Atoi(value)
+		if err != nil || load < 1 || load > 1000 {
+			t.Fatal("PODTEST_STANDARD_LOAD must be between 1 and 1000")
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 55*time.Second+time.Duration(load)*5*time.Second)
 	defer cancel()
 	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
 	if err != nil {
@@ -67,7 +77,7 @@ func TestStandardSubmissionExecution(t *testing.T) {
 	var archive bytes.Buffer
 	zipper := zip.NewWriter(&archive)
 	for name, data := range map[string]string{
-		"standard.json": `{"version":1,"language":"posix_sh","build":"package_source","checker":"exact_bytes","limits":{"wall_ms":2000,"output_bytes":4096},"groups":[{"id":"main","scoring":"sum"}],"tests":[{"id":"echo","group":"main","input":"tests/input","answer":"tests/answer","points_milli":1000}]}`,
+		"standard.json": `{"version":1,"language":"posix_sh","build":"package_source","checker":"exact_bytes","limits":{"wall_ms":20000,"output_bytes":4096},"groups":[{"id":"main","scoring":"sum"}],"tests":[{"id":"echo","group":"main","input":"tests/input","answer":"tests/answer","points_milli":1000}]}`,
 		"tests/input":   "hello\n", "tests/answer": "hello\n",
 	} {
 		file, err := zipper.Create(name)
@@ -77,6 +87,8 @@ func TestStandardSubmissionExecution(t *testing.T) {
 	}
 	must(zipper.Close())
 	must(manager.SetPackage(ctx, user, task, revision.ID, archive.Bytes()))
+	must(manager.EditPackageFile(ctx, user, task, revision.ID, "tests/input", []byte("edited\n"), false))
+	must(manager.EditPackageFile(ctx, user, task, revision.ID, "tests/answer", []byte("edited\n"), false))
 	must(manager.Validate(ctx, task, revision.ID))
 	must(manager.Publish(ctx, user, task, revision.ID))
 	cp, err := manager.Attach(ctx, user, contest, problem.AttachInput{ProblemID: task, RevisionID: revision.ID, MaxScore: "1", VerdictVisibility: "tests"})
@@ -93,7 +105,7 @@ func TestStandardSubmissionExecution(t *testing.T) {
 	must(provisionStandardQueue(ctx, js))
 	must(dispatch(ctx, pool, js))
 	invoker := uuid.NewString()
-	server := &standardCrashControl{ArtifactControl: &ArtifactControl{Pool: pool, Store: store}, committed: make(chan *pb.Event, 1)}
+	server := &standardCrashControl{ArtifactControl: &ArtifactControl{Pool: pool, Store: store}, committed: make(chan *pb.Event, 1), started: make(chan *pb.Event, 1), cancelled: make(chan *pb.Event, 1)}
 	control, _, tlsEnv := artifactClients(t, invoker, server)
 	state := t.TempDir()
 	must(os.Chmod(state, 0700))
@@ -109,11 +121,90 @@ func TestStandardSubmissionExecution(t *testing.T) {
 		}
 		return cmd
 	}
+	if load > 0 {
+		started := time.Now()
+		subs := Submissions{Pool: pool, Artifacts: store}
+		for i := 1; i < load; i++ {
+			_, err := subs.Submit(ctx, user, contest, cp, "posix_sh", []byte("exec cat\n"))
+			must(err)
+			must(dispatch(ctx, pool, js))
+		}
+		before, err := js.ConsumerInfo(jobStream, jobConsumer)
+		must(err)
+		if before.NumPending != uint64(load) {
+			t.Fatalf("queued before restore: %d, want %d", before.NumPending, load)
+		}
+		if hook := os.Getenv("PODTEST_NATS_RESTORE_HOOK"); hook != "" {
+			if out, err := exec.CommandContext(ctx, hook).CombinedOutput(); err != nil {
+				t.Fatalf("JetStream restore: %v\n%s", err, out)
+			}
+			restored, err := nats.Connect(url, nats.RetryOnFailedConnect(true))
+			must(err)
+			defer restored.Close()
+			js, err = restored.JetStream()
+			must(err)
+			after, err := js.ConsumerInfo(jobStream, jobConsumer, nats.Context(ctx))
+			must(err)
+			if after.NumPending != before.NumPending || after.Delivered != before.Delivered {
+				t.Fatalf("consumer state changed after restore: %+v", after)
+			}
+		}
+		// Exercise the ordinary service without the simulated ACK crashes below.
+		server.progressDropped.Store(true)
+		server.dropped.Store(true)
+		service := command("serve-standard")
+		service.Stdout, service.Stderr = os.Stdout, os.Stderr
+		must(service.Start())
+		defer service.Process.Kill()
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			var finished, total int
+			must(pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE j.status='finished' AND j.verdict='accepted' AND q.status='done'), count(*)
+				FROM judging_attempts j JOIN queue_entries q ON q.attempt_id=j.id WHERE q.contest_id=$1`, contest).Scan(&finished, &total))
+			info, err := js.ConsumerInfo(jobStream, jobConsumer, nats.Context(ctx))
+			must(err)
+			if finished == load && total == load && info.NumPending == 0 && info.NumAckPending == 0 {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				t.Fatalf("load timed out with %d/%d accepted, %d pending and %d unacked", finished, load, info.NumPending, info.NumAckPending)
+			case <-ticker.C:
+			}
+		}
+		must(service.Process.Signal(syscall.SIGTERM))
+		must(service.Wait())
+		t.Logf("%d jobs accepted and acknowledged in %s", load, time.Since(started).Round(time.Millisecond))
+		return
+	}
 	first := command("work-standard-once")
 	var workerLog bytes.Buffer
 	first.Stdout, first.Stderr = &workerLog, &workerLog
 	must(first.Start())
 	done := make(chan error, 1)
+	go func() { done <- first.Wait() }()
+	select {
+	case <-server.started:
+		items, err := (Submissions{Pool: pool}).Attempts(ctx, sub.ID, "manager")
+		must(err)
+		if len(items) != 1 || items[0].Phase != "testing" || !slices.Equal(items[0].ActiveTests, []string{"echo"}) {
+			t.Errorf("expected live test progress, got %+v", items)
+		}
+		must(first.Process.Kill())
+		if err := <-done; err == nil {
+			t.Fatal("worker exited before the simulated progress crash")
+		}
+	case err := <-done:
+		t.Fatalf("worker exited before test start: %v\n%s", err, &workerLog)
+	case <-ctx.Done():
+		<-done
+		t.Fatalf("test start not observed: %v\n%s", ctx.Err(), &workerLog)
+	}
+	workerLog.Reset()
+	first = command("work-standard-once")
+	first.Stdout, first.Stderr = &workerLog, &workerLog
+	must(first.Start())
 	go func() { done <- first.Wait() }()
 	var terminal *pb.Event
 	select {
@@ -134,6 +225,9 @@ func TestStandardSubmissionExecution(t *testing.T) {
 	if server.replays.Load() != 1 {
 		t.Fatalf("terminal duplicate ACKs = %d", server.replays.Load())
 	}
+	if server.progressReplays.Load() != 1 {
+		t.Fatalf("test start duplicate ACKs = %d", server.progressReplays.Load())
+	}
 	var result, verdict, score, testVerdict, groupScore, queue string
 	must(pool.QueryRow(ctx, `SELECT j.status,j.verdict,j.base_score::text,t.verdict,g.score::text,q.status
 		FROM judging_attempts j JOIN test_results t ON t.attempt_id=j.id AND t.test_id='echo'
@@ -141,6 +235,12 @@ func TestStandardSubmissionExecution(t *testing.T) {
 		WHERE j.id=$1`, attempt).Scan(&result, &verdict, &score, &testVerdict, &groupScore, &queue))
 	if result != "finished" || verdict != "accepted" || score != "1.000000" || testVerdict != "accepted" || groupScore != score || queue != "done" {
 		t.Fatalf("persisted results: %q %q %q %q %q %q", result, verdict, score, testVerdict, groupScore, queue)
+	}
+	var kinds []string
+	must(pool.QueryRow(ctx, `SELECT array_agg(kind ORDER BY sequence) FILTER (WHERE sequence>0) FROM judging_events WHERE attempt_id=$1`, attempt).Scan(&kinds))
+	wantKinds := []string{"run_started", "build_started", "build_finished", "test_started", "artifact_created", "test_finished", "subgroup_score", "problem_score", "attempt_finished"}
+	if !slices.Equal(kinds, wantKinds) {
+		t.Fatalf("ordered run events = %v, want %v", kinds, wantKinds)
 	}
 	stale := proto.CloneOf(terminal)
 	id := uuid.New()
@@ -218,6 +318,64 @@ func TestStandardSubmissionExecution(t *testing.T) {
 	if result != "finished" || verdict != "accepted" || score != "1.000000" {
 		t.Fatalf("replacement results: %q %q %q", result, verdict, score)
 	}
+	// Cancel after the solution container is running. Interrupt the worker
+	// after the cancellation commits to exercise durable acknowledgement replay.
+	subs := Submissions{Pool: pool, Artifacts: store}
+	slow, err := subs.Submit(ctx, user, contest, cp, "posix_sh", []byte("exec sleep 30\n"))
+	must(err)
+	var slowAttempt, slowRun string
+	must(pool.QueryRow(ctx, `SELECT id,run_id FROM judging_attempts WHERE submission_id=$1`, slow.ID).Scan(&slowAttempt, &slowRun))
+	must(dispatch(ctx, pool, js))
+	worker := command("work-standard-once")
+	workerLog.Reset()
+	worker.Stdout, worker.Stderr = &workerLog, &workerLog
+	must(worker.Start())
+	defer worker.Process.Kill()
+	go func() { done <- worker.Wait() }()
+	listContainers := func() []byte {
+		out, err := exec.CommandContext(ctx, "podman", "--remote", "--url", "unix://"+socket,
+			"ps", "--all", "--filter", "label=podtest.run_id="+slowRun, "--format", "{{.State}}").Output()
+		must(err)
+		return out
+	}
+	for !bytes.Contains(listContainers(), []byte("running")) {
+		select {
+		case err := <-done:
+			t.Fatalf("worker exited before running container: %v\n%s", err, &workerLog)
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-ticker.C:
+		}
+	}
+	pending, err := subs.Cancel(ctx, user, slow.ID, slowAttempt)
+	must(err)
+	if !pending {
+		t.Fatal("active cancellation did not enter pending state")
+	}
+	select {
+	case event := <-server.cancelled:
+		if event.AttemptId != slowAttempt || len(bytes.TrimSpace(listContainers())) != 0 {
+			t.Error("cancellation committed before the run's containers were removed")
+		}
+		must(worker.Process.Kill())
+		<-done
+	case err := <-done:
+		t.Fatalf("worker exited before cancelling: %v\n%s", err, &workerLog)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if out, err := command("work-standard-once").CombinedOutput(); err != nil {
+		t.Fatalf("worker could not replay cancellation: %v\n%s", err, out)
+	}
+	if server.cancelReplays.Load() != 1 {
+		t.Fatalf("cancellation duplicate ACKs = %d", server.cancelReplays.Load())
+	}
+	var clean bool
+	must(pool.QueryRow(ctx, `SELECT j.status='cancelled' AND j.verdict IS NULL AND j.base_score IS NULL AND q.status='done'
+		FROM judging_attempts j JOIN queue_entries q ON q.attempt_id=j.id WHERE j.id=$1`, slowAttempt).Scan(&clean))
+	if !clean {
+		t.Fatal("cancelled attempt retained results or a queue reservation")
+	}
 	if entries, err := os.ReadDir(filepath.Join(state, "container-journal-v1")); err == nil && len(entries) != 0 {
 		t.Fatalf("worker left %d resource ownership records", len(entries))
 	} else if err != nil && !os.IsNotExist(err) {
@@ -227,13 +385,36 @@ func TestStandardSubmissionExecution(t *testing.T) {
 
 type standardCrashControl struct {
 	*ArtifactControl
-	committed chan *pb.Event
-	replays   atomic.Int32
-	dropped   atomic.Bool
+	committed       chan *pb.Event
+	started         chan *pb.Event
+	cancelled       chan *pb.Event
+	replays         atomic.Int32
+	dropped         atomic.Bool
+	progressReplays atomic.Int32
+	progressDropped atomic.Bool
+	cancelReplays   atomic.Int32
 }
 
 func (s *standardCrashControl) Report(ctx context.Context, event *pb.Event) (*pb.Acknowledgement, error) {
 	ack, err := s.ArtifactControl.Report(ctx, event)
+	if err == nil && event.Kind == pb.Event_RUN_CANCELLED {
+		if ack.Duplicate {
+			s.cancelReplays.Add(1)
+			return ack, nil
+		}
+		s.cancelled <- proto.CloneOf(event)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if err == nil && event.Kind == pb.Event_TEST_STARTED {
+		if ack.Duplicate {
+			s.progressReplays.Add(1)
+		} else if !s.progressDropped.Swap(true) {
+			s.started <- proto.CloneOf(event)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+	}
 	if err != nil || event.Kind != pb.Event_RUN_FINISHED {
 		return ack, err
 	}
